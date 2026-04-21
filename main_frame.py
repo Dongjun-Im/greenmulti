@@ -299,6 +299,7 @@ class MainFrame(wx.Frame):
         self.id_search = wx.NewIdRef()
         self.id_page_down = wx.NewIdRef()
         self.id_page_up = wx.NewIdRef()
+        self.id_board_refresh = wx.NewIdRef()
         nav_menu.Append(self.id_goto, "바로가기(&G)\tAlt+G")
         nav_menu.Append(self.id_goto_main, "메인 메뉴로 이동(&H)\tAlt+Home")
         nav_menu.AppendSeparator()
@@ -307,6 +308,7 @@ class MainFrame(wx.Frame):
         nav_menu.Append(self.id_page_up, "이전 페이지(&B)\tPageUp")
         nav_menu.AppendSeparator()
         nav_menu.Append(self.id_search, "게시물 검색(&F)\tCtrl+F")
+        nav_menu.Append(self.id_board_refresh, "게시판 새로고침(&R)\tF5")
         menubar.Append(nav_menu, "이동(&N)")
 
         # 게시물 메뉴
@@ -324,7 +326,7 @@ class MainFrame(wx.Frame):
         self.id_theme = wx.NewIdRef()
         self.id_theme_cycle = wx.NewIdRef()
         self.id_theme_cycle_back = wx.NewIdRef()
-        settings_menu.Append(self.id_theme, "화면 테마 선택(&T)\tF5")
+        settings_menu.Append(self.id_theme, "화면 테마 선택(&T)\tF7")
         settings_menu.Append(self.id_theme_cycle, "다음 테마로 변경(&N)\tF6")
         settings_menu.Append(self.id_theme_cycle_back, "이전 테마로 변경(&P)\tShift+F6")
         settings_menu.AppendSeparator()
@@ -364,6 +366,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_change_theme, id=self.id_theme)
         self.Bind(wx.EVT_MENU, self.on_cycle_theme, id=self.id_theme_cycle)
         self.Bind(wx.EVT_MENU, self.on_cycle_theme_back, id=self.id_theme_cycle_back)
+        self.Bind(wx.EVT_MENU, self.on_board_refresh, id=self.id_board_refresh)
 
     def _build_status_bar(self):
         self.status_bar = self.CreateStatusBar(2)
@@ -406,9 +409,10 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("L"), self.id_logout),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("G"), self.id_goto),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F1, self.id_about),
-            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F5, self.id_theme),
+            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F5, self.id_board_refresh),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F6, self.id_theme_cycle),
             wx.AcceleratorEntry(wx.ACCEL_SHIFT, wx.WXK_F6, self.id_theme_cycle_back),
+            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F7, self.id_theme),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("E"), self.id_mail),
             # 글꼴 크기 단축키
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("="), self.id_zoom_in),
@@ -494,7 +498,7 @@ class MainFrame(wx.Frame):
         dlg = wx.SingleChoiceDialog(
             self,
             "사용할 화면 테마를 선택하세요.\n설정은 자동 저장됩니다.",
-            "화면 테마 변경 (F5)",
+            "화면 테마 변경 (F7)",
             theme_names,
         )
         dlg.SetSelection(current_idx)
@@ -1631,6 +1635,14 @@ class MainFrame(wx.Frame):
         if self.current_board_url:
             self._load_and_show(self.current_board_url, self.current_menu_name)
 
+    def on_board_refresh(self, event):
+        """F5: 현재 게시판 목록 새로고침."""
+        if self.current_view != VIEW_POST_LIST or not self.current_board_url:
+            speak("게시판에서만 새로고침할 수 있습니다.")
+            return
+        speak("새로고침 중입니다.")
+        self._load_and_show(self.current_board_url, self.current_menu_name)
+
     def on_goto(self, event):
         """바로가기 대화상자: 메인 메뉴 + 현재 하위 메뉴를 모두 포함"""
         from menu_manager import extract_shortcut_code
@@ -2140,6 +2152,7 @@ class MainFrame(wx.Frame):
             "PageDown: 다음 페이지",
             "PageUp: 이전 페이지",
             "Ctrl+F: 게시물 검색",
+            "F5: 게시판 새로고침",
             "",
             "=== 게시물 ===",
             "W: 게시물 작성",
@@ -2171,7 +2184,7 @@ class MainFrame(wx.Frame):
             "Alt+F4: 프로그램 종료",
             "",
             "=== 화면 설정 (저시력 지원) ===",
-            "F5: 화면 테마 선택 (목록)",
+            "F7: 화면 테마 선택 (목록)",
             "F6: 다음 테마로 변경",
             "Shift+F6: 이전 테마로 변경",
             "Ctrl++: 글꼴 크게 (확대)",

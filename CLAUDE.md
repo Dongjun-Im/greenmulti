@@ -22,10 +22,10 @@
 
 ## 화면 단축키 (`data/manual.txt` 참조)
 - 메뉴 탐색: ↑↓, Enter, Backspace/Esc(뒤로), Home/End
-- 이동: Alt+Home, Alt+G(바로가기), Ctrl+G(페이지), PageUp/Down, Ctrl+F(검색)
+- 이동: Alt+Home, Alt+G(바로가기), Ctrl+G(페이지), PageUp/Down, Ctrl+F(검색), F5(게시판 새로고침)
 - 게시물: W(작성), Alt+M(수정), Alt+D/Delete(삭제), Alt+R(답변)
 - 본문: B(TXT저장), Alt+S(첨부), C(댓글 작성), D/M(댓글 삭제/수정), Ctrl+U(URL 목록)
-- 테마/글꼴: F5(선택), F6/Shift+F6(다음/이전), Ctrl++/-/0
+- 테마/글꼴: F7(선택), F6/Shift+F6(다음/이전), Ctrl++/-/0
 
 ## Git 워크플로우
 원격: https://github.com/Dongjun-Im/greenmulti.git
