@@ -1,0 +1,86 @@
+{
+    "version": 3,
+    "description": "초록멀티 메뉴 목록",
+    "menus": [
+        {
+            "name": "초록등대 동호회",
+            "url": "/plugin/ar.club/?cl=green",
+            "type": "club"
+        },
+        {
+            "name": "1. 소리샘 공지사항",
+            "url": "/bbs/board.php?bo_table=sorisemnotice",
+            "type": "board"
+        },
+        {
+            "name": "3. 개발자 포럼",
+            "url": "/?mo=prg",
+            "type": "category"
+        },
+        {
+            "name": "4. 동호회",
+            "url": "/?mo=potion",
+            "type": "category"
+        },
+        {
+            "name": "5. 잡지",
+            "url": "/?mo=magazin",
+            "type": "category"
+        },
+        {
+            "name": "6. 자료실",
+            "url": "/?mo=pds",
+            "type": "category"
+        },
+        {
+            "name": "7. 전자도서관",
+            "url": "/?mo=lib2013",
+            "type": "category"
+        },
+        {
+            "name": "8. 노원시각장애인학습지원센터",
+            "url": "/?mo=edu2013&cl=edu2013",
+            "type": "category"
+        },
+        {
+            "name": "9. 점자도서관",
+            "url": "/?mo=braille",
+            "type": "category"
+        },
+        {
+            "name": "98. 설문조사",
+            "url": "/?mo=question&cl=question",
+            "type": "category"
+        },
+        {
+            "name": "99. 소리샘 동사무소",
+            "url": "/mypage/",
+            "type": "category"
+        },
+        {
+            "name": "100. 넓은마을 바로가기",
+            "url": "http://web.kbuwel.or.kr",
+            "type": "external"
+        },
+        {
+            "name": "101. 행복을 들려주는 도서관 바로가기",
+            "url": "http://happy.sorisem.net",
+            "type": "external"
+        },
+        {
+            "name": "102. 미디어접근센터(MAC) 바로가기",
+            "url": "http://www.kbumac.or.kr",
+            "type": "external"
+        },
+        {
+            "name": "103. 주요 사이트 바로가기",
+            "url": "/?mo=sitelink",
+            "type": "category"
+        },
+        {
+            "name": "104. LG전자 유튜브 채널",
+            "url": "/?mo=lgyoutube",
+            "type": "category"
+        }
+    ]
+}

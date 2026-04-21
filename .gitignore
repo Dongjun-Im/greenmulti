@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.Python
+
+# Virtual environments
+.venv*/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Sensitive user data
+data/credentials.ini
+data/download_dir.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
