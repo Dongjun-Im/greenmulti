@@ -72,7 +72,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='초록멀티 v1.3',
+    name='초록멀티 v1.4',
     debug=False,
     strip=False,
     upx=False,
@@ -88,5 +88,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='초록멀티 v1.3',
+    name='초록멀티 v1.4',
 )

@@ -12,6 +12,8 @@ from config import (
     APP_NAME, APP_VERSION, APP_BUILD_DATE, APP_AUTHOR, APP_EMAIL,
     APP_ADMIN_EMAIL, APP_COPYRIGHT, SORISEM_BASE_URL,
     DATA_DIR,
+    load_search_history, add_search_history,
+    resource_path,
 )
 from menu_manager import MenuManager
 from page_parser import (
@@ -409,7 +411,9 @@ class MainFrame(wx.Frame):
         self.id_about = wx.NewIdRef()
         self.id_shortcuts = wx.NewIdRef()
         self.id_mail = wx.NewIdRef()
+        self.id_manual = wx.NewIdRef()
         help_menu.Append(self.id_about, "프로그램 정보(&A)\tF1")
+        help_menu.Append(self.id_manual, "사용자 설명서(&U)\tShift+F1")
         help_menu.Append(self.id_shortcuts, "단축키 안내(&K)\tCtrl+K")
         help_menu.AppendSeparator()
         help_menu.Append(self.id_mail, "관리자에게 메일 보내기(&E)\tAlt+E")
@@ -432,6 +436,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_menu_post_edit, id=self.id_post_edit)
         self.Bind(wx.EVT_MENU, self._on_menu_post_delete, id=self.id_post_delete)
         self.Bind(wx.EVT_MENU, self.on_about, id=self.id_about)
+        self.Bind(wx.EVT_MENU, self.on_show_manual, id=self.id_manual)
         self.Bind(wx.EVT_MENU, self.on_shortcuts_help, id=self.id_shortcuts)
         self.Bind(wx.EVT_MENU, self.on_mail, id=self.id_mail)
         self.Bind(wx.EVT_MENU, self.on_show_settings, id=self.id_settings)
@@ -480,6 +485,7 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("N"), self.id_nas_connect),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("G"), self.id_goto),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F1, self.id_about),
+            wx.AcceleratorEntry(wx.ACCEL_SHIFT, wx.WXK_F1, self.id_manual),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F5, self.id_board_refresh),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F7, self.id_settings),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("E"), self.id_mail),
@@ -1052,9 +1058,12 @@ class MainFrame(wx.Frame):
             self.on_shortcuts_help(None)
             return
 
-        # F1: 프로그램 정보
+        # Shift+F1: 사용자 설명서 / F1: 프로그램 정보
         elif keycode == wx.WXK_F1:
-            self.on_about(None)
+            if event.ShiftDown():
+                self.on_show_manual(None)
+            else:
+                self.on_about(None)
             return
 
         # Alt+Home: 메인 메뉴(초기 화면)으로 돌아가기
@@ -1275,14 +1284,16 @@ class MainFrame(wx.Frame):
         panel = wx.Panel(dlg)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
+        type_names = [t[0] for t in search_types]
         type_label = wx.StaticText(panel, label="검색 유형(&T):")
         type_combo = wx.ComboBox(
-            panel, choices=[t[0] for t in search_types],
+            panel, choices=type_names,
             style=wx.CB_READONLY, name="검색 유형",
         )
         type_combo.SetSelection(0)
 
-        query_label = wx.StaticText(panel, label="검색어(&S):")
+        hist_hint = " (↑↓: 최근 검색어)" if load_search_history() else ""
+        query_label = wx.StaticText(panel, label=f"검색어(&S){hist_hint}:")
         query_input = wx.TextCtrl(panel, name="검색어", style=wx.TE_PROCESS_ENTER)
 
         btn_sizer = wx.StdDialogButtonSizer()
@@ -1300,11 +1311,52 @@ class MainFrame(wx.Frame):
         sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10)
         panel.SetSizer(sizer)
         sizer.Fit(dlg)
-        dlg.SetMinSize(wx.Size(350, -1))
+        dlg.SetMinSize(wx.Size(360, -1))
         dlg.Fit()
         query_input.SetFocus()
         dlg.Centre()
 
+        # ── 검색 히스토리 (최대 10개, 최신이 0) ──
+        history = load_search_history()
+        # hist_idx: -1 = 사용자가 입력 중인 원본, 0.. = 히스토리 항목
+        hist_state = {"idx": -1, "draft": ""}
+
+        def apply_history(idx: int):
+            """idx에 맞게 입력창/유형을 채운다."""
+            hist_state["idx"] = idx
+            if idx == -1:
+                query_input.ChangeValue(hist_state["draft"])
+            else:
+                item = history[idx]
+                query_input.ChangeValue(item.get("query", ""))
+                t = item.get("type", "")
+                if t in type_names:
+                    type_combo.SetSelection(type_names.index(t))
+                speak(f"최근 검색 {idx + 1}번, {item.get('query', '')}")
+            query_input.SetInsertionPointEnd()
+
+        def on_query_key(event: wx.KeyEvent):
+            key = event.GetKeyCode()
+            if key == wx.WXK_UP:
+                if not history:
+                    speak("검색 히스토리가 없습니다.")
+                    return
+                if hist_state["idx"] == -1:
+                    hist_state["draft"] = query_input.GetValue()
+                new_idx = min(hist_state["idx"] + 1, len(history) - 1)
+                if new_idx == hist_state["idx"]:
+                    speak("가장 오래된 검색어입니다.")
+                    return
+                apply_history(new_idx)
+            elif key == wx.WXK_DOWN:
+                if hist_state["idx"] == -1:
+                    return
+                new_idx = hist_state["idx"] - 1
+                apply_history(new_idx)
+            else:
+                event.Skip()
+
+        query_input.Bind(wx.EVT_KEY_DOWN, on_query_key)
         # Enter키로 검색
         query_input.Bind(wx.EVT_TEXT_ENTER, lambda e: dlg.EndModal(wx.ID_OK))
 
@@ -1318,6 +1370,8 @@ class MainFrame(wx.Frame):
 
         if not query:
             return
+
+        add_search_history(query, search_types[type_idx][0])
 
         sfl = search_types[type_idx][1]
         type_name = search_types[type_idx][0]
@@ -2276,6 +2330,37 @@ class MainFrame(wx.Frame):
 
     # ── 프로그램 정보 (F1) ──
 
+    # ── 사용자 설명서 (Shift+F1) ──
+
+    def on_show_manual(self, event):
+        """Shift+F1: 사용자 설명서 대화상자"""
+        manual_path = resource_path("data", "manual.txt")
+        try:
+            with open(manual_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            speak("사용자 설명서 파일을 열 수 없습니다.")
+            wx.MessageBox(
+                f"사용자 설명서를 불러올 수 없습니다.\n"
+                f"경로: {manual_path}\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        chapters = _parse_manual_chapters(text)
+        if not chapters:
+            speak("사용자 설명서 내용을 읽을 수 없습니다.")
+            return
+
+        dlg = ManualDialog(self, chapters, self.current_font_size)
+        try:
+            apply_theme(dlg, make_font(self.current_font_size))
+        except Exception:
+            pass
+        speak("사용자 설명서. 왼쪽 목록에서 챕터를 선택하세요.")
+        dlg.ShowModal()
+        dlg.Destroy()
+
     def on_about(self, event):
         info = wx.adv.AboutDialogInfo()
         info.SetName(APP_NAME)
@@ -2341,6 +2426,7 @@ class MainFrame(wx.Frame):
             "Ctrl+N: 초록등대 자료실(NAS) 연결",
             "Alt+E: 관리자에게 메일 보내기",
             "F1: 프로그램 정보",
+            "Shift+F1: 사용자 설명서",
             "Alt+F4: 프로그램 종료",
             "",
             "=== 화면 설정 (저시력 지원) ===",
@@ -2376,3 +2462,160 @@ class MainFrame(wx.Frame):
 
     def on_exit(self, event):
         self.Close()
+
+
+# ─────────────────────────────────────────────────────────────
+# 사용자 설명서 (Shift+F1)
+# ─────────────────────────────────────────────────────────────
+
+def _parse_manual_chapters(text: str) -> list[tuple[str, str]]:
+    """manual.txt를 챕터 단위로 분할. 반환: [(제목, 본문), ...]
+
+    챕터 경계: "숫자. 제목" 다음 줄이 ---- 또는 ==== 같은 구분선.
+    구분선도 본문에 포함해 화면상 그대로 보이게 둔다.
+    """
+    lines = text.splitlines()
+    # 챕터 시작 라인 인덱스 수집
+    starts: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = re.match(r'^(\d+)\.\s+(.+)$', line.rstrip())
+        if not m:
+            continue
+        # 다음 줄이 구분선(-, =) 연속 문자여야 챕터 헤더로 인정
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and set(nxt) <= {"-", "="} and len(nxt) >= 3:
+                starts.append((i, line.rstrip()))
+
+    if not starts:
+        return []
+
+    chapters: list[tuple[str, str]] = []
+    for idx, (start, title) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
+        body = "\n".join(lines[start:end]).rstrip() + "\n"
+        chapters.append((title, body))
+    return chapters
+
+
+class ManualDialog(wx.Dialog):
+    """사용자 설명서 대화상자.
+
+    좌측: 챕터 목록 (ListBox) — ↑/↓로 챕터 이동
+    우측: 선택된 챕터 본문 (ReadOnly TextCtrl)
+    Tab: 목록 ↔ 본문 포커스 전환, ESC: 닫기
+    """
+
+    def __init__(self, parent, chapters: list[tuple[str, str]], font_size: int):
+        super().__init__(
+            parent,
+            title="초록멀티 사용자 설명서",
+            size=(780, 560),
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        self._chapters = chapters
+
+        panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        # 좌측: 챕터 목록
+        left_sizer = wx.BoxSizer(wx.VERTICAL)
+        list_label = wx.StaticText(panel, label="챕터 목록(&C):")
+        titles = [t for (t, _) in chapters]
+        self.list_box = wx.ListBox(
+            panel, choices=titles, style=wx.LB_SINGLE, name="챕터 목록",
+        )
+        left_sizer.Add(list_label, 0, wx.ALL, 5)
+        left_sizer.Add(self.list_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # 우측: 본문
+        right_sizer = wx.BoxSizer(wx.VERTICAL)
+        body_label = wx.StaticText(panel, label="본문(&B):")
+        self.body_text = wx.TextCtrl(
+            panel, value="",
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP | wx.HSCROLL,
+            name="본문",
+        )
+        self.body_text.SetFont(make_font(font_size))
+        right_sizer.Add(body_label, 0, wx.ALL, 5)
+        right_sizer.Add(self.body_text, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        main_sizer.Add(left_sizer, 1, wx.EXPAND)
+        main_sizer.Add(right_sizer, 2, wx.EXPAND)
+
+        # 닫기 버튼
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(main_sizer, 1, wx.EXPAND | wx.ALL, 5)
+        close_btn = wx.Button(panel, wx.ID_CANCEL, "닫기(&X)")
+        outer.Add(close_btn, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        panel.SetSizer(outer)
+
+        # 이벤트 바인딩
+        self.list_box.Bind(wx.EVT_LISTBOX, self._on_chapter_select)
+        self.list_box.Bind(wx.EVT_LISTBOX_DCLICK, self._on_chapter_activate)
+        self.list_box.Bind(wx.EVT_KEY_DOWN, self._on_list_key)
+        self.body_text.Bind(wx.EVT_KEY_DOWN, self._on_body_key)
+
+        # ESC로 닫기 — ID_CANCEL은 기본 바인딩됨
+        self.SetEscapeId(wx.ID_CANCEL)
+
+        # 초기 선택
+        if chapters:
+            self.list_box.SetSelection(0)
+            self._show_chapter(0)
+        self.list_box.SetFocus()
+        self.Centre()
+
+    def _show_chapter(self, idx: int):
+        if 0 <= idx < len(self._chapters):
+            title, body = self._chapters[idx]
+            self.body_text.ChangeValue(body)
+            self.body_text.SetInsertionPoint(0)
+
+    def _on_chapter_select(self, event):
+        self._show_chapter(self.list_box.GetSelection())
+
+    def _on_chapter_activate(self, event):
+        """더블클릭 또는 Enter → 본문으로 포커스"""
+        idx = self.list_box.GetSelection()
+        if idx != wx.NOT_FOUND:
+            title, _ = self._chapters[idx]
+            self.body_text.SetFocus()
+            self.body_text.SetInsertionPoint(0)
+            speak(f"{title} 본문")
+
+    def _on_list_key(self, event: wx.KeyEvent):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self._on_chapter_activate(event)
+            return
+        if key == wx.WXK_TAB:
+            self.body_text.SetFocus()
+            return
+        event.Skip()
+
+    def _on_body_key(self, event: wx.KeyEvent):
+        key = event.GetKeyCode()
+        # Ctrl+PageUp / PageDown → 이전/다음 챕터
+        if event.ControlDown() and key == wx.WXK_PAGEUP:
+            self._move_chapter(-1)
+            return
+        if event.ControlDown() and key == wx.WXK_PAGEDOWN:
+            self._move_chapter(+1)
+            return
+        if key == wx.WXK_TAB:
+            self.list_box.SetFocus()
+            return
+        event.Skip()
+
+    def _move_chapter(self, delta: int):
+        cur = self.list_box.GetSelection()
+        if cur == wx.NOT_FOUND:
+            return
+        new_idx = max(0, min(len(self._chapters) - 1, cur + delta))
+        if new_idx == cur:
+            return
+        self.list_box.SetSelection(new_idx)
+        self._show_chapter(new_idx)
+        title = self._chapters[new_idx][0]
+        speak(title)
