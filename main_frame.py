@@ -276,16 +276,15 @@ class MainFrame(wx.Frame):
         wx.CallLater(500, self._try_auto_mount_nas)
 
     def _try_auto_mount_nas(self):
-        """저장된 NAS 자격증명이 있으면 백그라운드로 마운트 시도."""
+        """저장된 NAS 자격증명이 있으면 백그라운드로 rclone 마운트 시도."""
         try:
             from nas import (
                 load_nas_credentials, mount, find_existing_mount,
-                SSL_UNTRUSTED_MARKER,
+                _is_winfsp_missing, WINFSP_DOWNLOAD_URL,
             )
         except Exception:
             return
 
-        # 이미 마운트되어 있으면 재연결 불필요, 안내만
         existing = find_existing_mount()
         if existing:
             speak("초록등대 자료실에 연결되었습니다.")
@@ -293,7 +292,7 @@ class MainFrame(wx.Frame):
 
         creds = load_nas_credentials()
         if not creds:
-            return  # 저장된 자격증명 없음 → 조용히 패스
+            return
         user, pw = creds
 
         import threading
@@ -303,11 +302,9 @@ class MainFrame(wx.Frame):
             if ok:
                 wx.CallAfter(self._notify_nas_connected)
                 return
-            if info and SSL_UNTRUSTED_MARKER in info:
-                wx.CallAfter(self._prompt_cert_install_and_retry, user, pw)
+            if _is_winfsp_missing(info):
+                wx.CallAfter(self._prompt_winfsp_install, WINFSP_DOWNLOAD_URL)
                 return
-            # SSL 외 실패도 사용자에게 안내 (자격증명 변경·서버 접근 불가 등
-            # 자동 마운트가 왜 실패했는지 명확히 알려줘야 대응 가능).
             wx.CallAfter(speak, "초록등대 자료실 자동 연결에 실패했습니다.")
             wx.CallAfter(
                 wx.MessageBox,
@@ -318,168 +315,31 @@ class MainFrame(wx.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _notify_nas_connected(self):
-        """연결 성공 시 음성 안내 + 정보 팝업을 한 번에 표시."""
+        """연결 성공 시 음성 안내 + 정보 팝업."""
         speak("초록등대 자료실에 연결되었습니다.")
         wx.MessageBox(
             "초록등대 자료실에 연결되었습니다.",
             "연결 완료", wx.OK | wx.ICON_INFORMATION, self,
         )
 
-    def _prompt_cert_install_and_retry(self, user: str, password: str):
-        """SSL 인증서 미신뢰 상황에서 사용자 동의 받고 자동 설치 + 재연결."""
+    def _prompt_winfsp_install(self, download_url: str):
+        """WinFSP 미설치 안내. 링크를 브라우저로 열어 줌."""
         r = wx.MessageBox(
-            "NAS 서버의 SSL 인증서가 이 PC에서 신뢰되지 않아 드라이브 연결을 할 수 "
-            "없습니다.\n\n이 컴퓨터의 '신뢰할 수 있는 루트 인증 기관'에 NAS 인증서를 "
-            "자동으로 설치하시겠습니까?\n\n설치 과정에서 Windows 보안 경고창이 "
-            "나타날 수 있으며 '예'를 클릭해야 실제 설치됩니다.",
-            "초록등대 자료실 - 인증서 자동 설치",
-            wx.YES_NO | wx.ICON_QUESTION, self,
-        )
-        if r != wx.YES:
-            speak("인증서 설치를 취소했습니다.")
-            return
-
-        speak("인증서를 설치하고 있습니다. Windows 보안 경고가 나타나면 예를 눌러 주세요.")
-
-        import threading
-
-        def work():
-            try:
-                from nas import install_server_cert_to_trust_store, mount
-            except Exception as e:
-                wx.CallAfter(speak, f"NAS 모듈 로드 실패. {e}")
-                return
-            ok, msg = install_server_cert_to_trust_store()
-            if not ok:
-                wx.CallAfter(speak, f"인증서 설치 실패. {msg}")
-                wx.CallAfter(
-                    wx.MessageBox,
-                    f"인증서 설치 실패.\n{msg}\n\n"
-                    "수동 설치 방법: 브라우저로 해당 주소 접속 → 인증서 보기 → "
-                    "'신뢰할 수 있는 루트 인증 기관'에 설치.",
-                    "오류", wx.OK | wx.ICON_ERROR, self,
-                )
-                return
-            wx.CallAfter(speak, "인증서 설치 완료. 다시 연결합니다.")
-            # Python certifi 와 Windows 인증서 저장소는 별개라 preflight 가 아직
-            # SSL 불신뢰로 잘못 판정할 수 있으므로 스킵.
-            ok2, info2 = mount(user, password, skip_preflight=True)
-            if ok2:
-                wx.CallAfter(self._notify_nas_connected)
-                return
-            # CurrentUser 저장소는 WebClient(LocalService 계정)가 못 본다.
-            # BasicAuthLevel/AuthForwardServerList 도 HKLM 이라 관리자 권한 필요.
-            # 사용자 동의 받고 UAC 상승 플로우로 일괄 수정 후 재시도.
-            wx.CallAfter(self._prompt_elevated_webdav_fix, user, password, info2)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _prompt_elevated_webdav_fix(self, user: str, password: str,
-                                    prev_error: str):
-        """사용자 권한 인증서 설치로도 부족할 때: UAC 상승해서 LocalMachine
-        인증서 + WebClient 레지스트리 + 서비스 재시작을 일괄 처리."""
-        r = wx.MessageBox(
-            "인증서를 설치했지만 Windows 드라이브 매핑이 여전히 실패합니다.\n\n"
-            "Windows WebClient 서비스(LocalService 계정)는 현재 사용자 인증서 "
-            "저장소를 볼 수 없고, Basic 인증 관련 시스템 설정(BasicAuthLevel, "
-            "AuthForwardServerList)은 관리자 권한으로만 변경 가능합니다.\n\n"
-            "지금 관리자 권한을 요청해서 다음을 일괄 적용하시겠습니까?\n"
-            "  1) 인증서를 시스템 전역 '신뢰할 수 있는 루트 인증 기관'에 설치\n"
-            "  2) WebClient 레지스트리 설정 조정 (BasicAuthLevel=2 등)\n"
-            "  3) WebClient 서비스 재시작\n\n"
-            "확인을 누르면 UAC(사용자 계정 컨트롤) 대화상자가 표시됩니다.\n\n"
-            f"이전 오류:\n{prev_error}",
-            "NAS 연결 — 시스템 설정 조정 필요",
-            wx.YES_NO | wx.ICON_QUESTION, self,
-        )
-        if r != wx.YES:
-            speak("NAS 시스템 설정 조정을 취소했습니다.")
-            return
-
-        speak("관리자 권한으로 Windows 설정을 조정하고 있습니다.")
-
-        import threading
-
-        def work():
-            try:
-                from nas import elevated_fix_webdav_trust, mount
-            except Exception as e:
-                wx.CallAfter(speak, f"NAS 모듈 로드 실패. {e}")
-                return
-            ok, msg = elevated_fix_webdav_trust()
-            if not ok:
-                wx.CallAfter(speak, f"시스템 설정 조정 실패. {msg}")
-                wx.CallAfter(
-                    wx.MessageBox,
-                    f"시스템 설정 조정에 실패했습니다.\n{msg}\n\n"
-                    "UAC 대화상자에서 '예'를 눌러야 진행됩니다.",
-                    "오류", wx.OK | wx.ICON_ERROR, self,
-                )
-                return
-            wx.CallAfter(speak, "시스템 설정을 적용했습니다. 다시 연결합니다.")
-            # WebClient 재시작 후 잠깐 대기
-            import time
-            time.sleep(3)
-            ok2, info2 = mount(user, password, skip_preflight=True)
-            if ok2:
-                wx.CallAfter(self._notify_nas_connected)
-            else:
-                wx.CallAfter(self._prompt_explorer_fallback, msg, info2)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _prompt_explorer_fallback(self, setup_log: str, mount_error: str):
-        """Windows net use 마운트가 끝내 실패할 때의 폴백. 모든 시스템 설정이
-        적용됐음에도 net use 가 1244/1790/59 를 반환하는 Synology + Windows
-        WebClient 비호환 상황. 탐색기 자체 WebDAV 핸들러로 넘어감 + Windows
-        '내 PC → 네트워크 위치' 에 영구 바로가기 등록."""
-        try:
-            from nas import (
-                NAS_URL, open_nas_url_in_explorer,
-                create_desktop_url_shortcut,
-            )
-        except Exception:
-            NAS_URL = "https://webdav.kbugreenlight.synology.me:5006"
-            open_nas_url_in_explorer = None
-            create_desktop_url_shortcut = None
-
-        # 바탕화면 바로가기 생성 (묻지 않고 바로)
-        shortcut_ok = False
-        shortcut_path = ""
-        if create_desktop_url_shortcut:
-            shortcut_ok, shortcut_path = create_desktop_url_shortcut()
-
-        shortcut_line = (
-            f"\n바탕화면에 '초록등대 자료실' 인터넷 바로가기를 생성했습니다. "
-            "앞으로는 그 바로가기를 더블클릭해서 언제든 접속할 수 있습니다."
-            if shortcut_ok else ""
-        )
-
-        r = wx.MessageBox(
-            "Windows 드라이브 문자 매핑이 이 Synology 서버 구성과 근본적으로 "
-            "호환되지 않습니다. 시스템 설정은 정상 적용됐지만 Windows WebClient "
-            "자체가 이 서버 응답을 거부합니다.\n\n"
-            "대신 NAS 주소를 브라우저로 열겠습니다. Basic 인증 프롬프트가 뜨면 "
-            "NAS 아이디/비밀번호를 입력해서 웹 UI 로 파일 브라우징·다운로드를 "
-            "하실 수 있습니다."
-            + shortcut_line +
-            "\n\n계속하시겠습니까?",
-            "NAS 연결 — 브라우저 폴백",
+            "드라이브 문자 매핑에 필요한 WinFSP 가 이 PC에 설치되어 있지 않습니다.\n\n"
+            "WinFSP 는 오픈소스 Windows 파일 시스템 드라이버로, 초록등대 자료실을 "
+            "일반 드라이브처럼 쓰기 위해 한 번만 설치하면 됩니다.\n\n"
+            "지금 다운로드 페이지를 열까요? (페이지에서 최신 .msi 파일을 받아 설치하세요)",
+            "WinFSP 설치 필요",
             wx.YES_NO | wx.ICON_INFORMATION, self,
         )
-        if r != wx.YES:
-            return
-
-        try:
-            os.startfile(NAS_URL)
-            speak("브라우저에서 초록등대 자료실을 엽니다.")
-        except Exception as e:
-            speak(f"브라우저 열기 실패. {e}")
-            wx.MessageBox(
-                f"브라우저로 주소를 열지 못했습니다.\n\n{e}\n\n"
-                f"수동으로 다음 주소를 브라우저에 입력해 주세요:\n{NAS_URL}",
-                "오류", wx.OK | wx.ICON_ERROR, self,
-            )
+        if r == wx.YES:
+            try:
+                os.startfile(download_url)
+            except Exception as e:
+                wx.MessageBox(
+                    f"브라우저 열기 실패.\n\n{download_url}\n\n{e}",
+                    "오류", wx.OK | wx.ICON_ERROR, self,
+                )
 
     # ── 메뉴바 ──
 
@@ -1546,14 +1406,13 @@ class MainFrame(wx.Frame):
             )
 
     def _activate_nas_menu(self):
-        """초록등대 자료실 연결. 이미 마운트되어 있으면 탐색기로 열기,
-        아니면 자격증명 입력 → 마운트 → 탐색기로 열기."""
+        """초록등대 자료실 연결. rclone + WinFSP 기반."""
         try:
             from nas import (
                 get_mounted_drive, open_in_explorer,
                 prompt_and_mount, load_nas_credentials, mount,
-                delete_nas_credentials, SSL_UNTRUSTED_MARKER,
-                _is_auth_error,
+                delete_nas_credentials, _is_auth_error, _is_winfsp_missing,
+                WINFSP_DOWNLOAD_URL,
             )
         except Exception as e:
             speak(f"NAS 모듈을 불러올 수 없습니다. {e}")
@@ -1568,7 +1427,7 @@ class MainFrame(wx.Frame):
                 speak("드라이브를 열 수 없습니다.")
             return
 
-        # 2) 저장된 자격증명이 있으면 자동 시도 후 성공 시 열기
+        # 2) 저장된 자격증명이 있으면 자동 시도
         creds = load_nas_credentials()
         if creds:
             user, pw = creds
@@ -1578,20 +1437,15 @@ class MainFrame(wx.Frame):
                 self._notify_nas_connected()
                 open_in_explorer(info)
                 return
-            # SSL 인증서 미신뢰면 자동 설치 플로우로
-            if info and SSL_UNTRUSTED_MARKER in info:
-                self._prompt_cert_install_and_retry(user, pw)
+            if _is_winfsp_missing(info):
+                self._prompt_winfsp_install(WINFSP_DOWNLOAD_URL)
                 return
-            # 401(자격증명 오류)면 저장본 삭제 후 재입력 제안
-            if info and _is_auth_error(info):
+            if _is_auth_error(info):
                 delete_nas_credentials()
-                if self._ask_reenter_credentials_on_auth_error(info):
-                    # 아래 3) 재입력 플로우로 폴스루
-                    pass
-                else:
+                if not self._ask_reenter_credentials_on_auth_error(info):
                     return
+                # 3) 재입력 플로우로 폴스루
             else:
-                # 그 외 실패
                 wx.MessageBox(
                     f"저장된 자격증명으로 연결에 실패했습니다.\n\n{info}",
                     "NAS 연결 실패", wx.OK | wx.ICON_WARNING, self,
@@ -1599,44 +1453,22 @@ class MainFrame(wx.Frame):
                 return
 
         # 3) 자격증명 입력 대화상자 → 마운트
-        # speak_func=None: prompt_and_mount 내부 음성 안내를 비활성화하고,
-        # 여기서 _notify_nas_connected() 로 음성+팝업을 통일해 중복 방지.
         ok, info = prompt_and_mount(self, speak_func=None)
         if ok:
             from nas import open_in_explorer as _open
             self._notify_nas_connected()
             _open(info)
             return
-        if info and SSL_UNTRUSTED_MARKER in info:
-            # prompt_and_mount 가 확인 시점에 자격증명을 이미 저장했으므로 로드 가능.
-            saved = load_nas_credentials()
-            if saved:
-                self._prompt_cert_install_and_retry(*saved)
-                return
-            # 예외적으로 로드 실패한 경우에도 사용자에게 상황을 알림
-            wx.MessageBox(
-                "자격증명과 서버는 정상이지만 이 PC가 NAS 인증서를 신뢰하지 않습니다.\n"
-                "Ctrl+N으로 다시 시도하면 인증서 자동 설치 안내가 나옵니다.",
-                "NAS 연결 — 인증서 신뢰 필요",
-                wx.OK | wx.ICON_WARNING, self,
-            )
+        if _is_winfsp_missing(info):
+            self._prompt_winfsp_install(WINFSP_DOWNLOAD_URL)
             return
-        if info and _is_auth_error(info):
-            # 자격증명 문제 → 친절 안내 + 재입력 제안
+        if _is_auth_error(info):
             if self._ask_reenter_credentials_on_auth_error(info):
-                # 사용자가 예 선택 → 재귀적으로 연결 시도 (저장본은 이미 지워짐)
                 self._activate_nas_menu()
             return
         if info and info != "취소되었습니다.":
             wx.MessageBox(
                 f"NAS 연결 실패.\n{info}",
-                "오류", wx.OK | wx.ICON_ERROR, self,
-            )
-            return
-        # 취소한 경우는 조용히 패스하되, info 가 비어있는 예기치 않은 경로에 대비
-        if not info:
-            wx.MessageBox(
-                "NAS 연결 결과를 확인할 수 없습니다. 다시 시도해 주세요.",
                 "오류", wx.OK | wx.ICON_ERROR, self,
             )
 
@@ -2506,12 +2338,13 @@ class MainFrame(wx.Frame):
             "Ctrl+J: 다운로드 상태",
             "Ctrl+K: 단축키 안내",
             "Ctrl+L: 로그아웃",
+            "Ctrl+N: 초록등대 자료실(NAS) 연결",
             "Alt+E: 관리자에게 메일 보내기",
             "F1: 프로그램 정보",
             "Alt+F4: 프로그램 종료",
             "",
             "=== 화면 설정 (저시력 지원) ===",
-            "F7: 화면 테마 선택 (목록)",
+            "F7: 설정 창 열기 (테마·글꼴·사운드 통합)",
             "F6: 다음 테마로 변경",
             "Shift+F6: 이전 테마로 변경",
             "Ctrl++: 글꼴 크게 (확대)",

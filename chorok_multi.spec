@@ -41,6 +41,7 @@ a = Analysis(
         (os.path.join(app_dir, 'data'), 'data'),
         (os.path.join(app_dir, 'sounds'), 'sounds'),
         (os.path.join(app_dir, 'green_auth'), 'green_auth'),
+        (os.path.join(app_dir, 'bin'), 'bin'),
     ],
     hiddenimports=[
         'green_auth',
@@ -71,12 +72,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='초록멀티',
+    name='초록멀티 v1.3',
     debug=False,
     strip=False,
     upx=False,
     console=False,
     icon=os.path.join(app_dir, 'data', 'icon.ico'),
+    version=os.path.join(app_dir, 'version_info.txt'),
 )
 
 coll = COLLECT(
@@ -86,5 +88,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='초록멀티',
+    name='초록멀티 v1.3',
 )
