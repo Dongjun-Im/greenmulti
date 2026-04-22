@@ -101,11 +101,18 @@ class MenuManager:
                     url=item["url"],
                     menu_type=item.get("type", "board"),
                 ))
-            return self.menus
-
         except (json.JSONDecodeError, KeyError):
             self.menus = self._default_menus()
-            return self.menus
+
+        # 메인 메뉴에서 "nas" 타입 엔트리 제거 — 이제 메뉴바 '도구' 메뉴로 이동함
+        before = len(self.menus)
+        self.menus = [m for m in self.menus if m.type != "nas"]
+        if len(self.menus) != before:
+            try:
+                self.save()
+            except Exception:
+                pass
+        return self.menus
 
     def save(self) -> None:
         data = {

@@ -6,6 +6,41 @@ from bs4 import BeautifulSoup
 from config import SORISEM_BASE_URL
 
 
+def _unwrap_js_url(href: str) -> str:
+    """gnuboard 스타일의 javascript:delete_comment('/bbs/...?token=...')
+    같은 래퍼에서 실제 URL만 추출한다. javascript: 가 아니면 그대로 반환.
+    따옴표 안의 문자열이 여러 개일 경우 (예: confirm 메시지와 URL이 함께 있는
+    형태) URL처럼 보이는 것을 우선 선택한다."""
+    if not href:
+        return ""
+    h = href.strip()
+    if not h.lower().startswith("javascript:"):
+        return h
+    # javascript:funcname('A', 'B', ...) 의 모든 quoted 문자열 후보 수집
+    candidates = re.findall(r"""['"]([^'"]+)['"]""", h)
+    if not candidates:
+        return ""
+    # URL로 보이는 후보(절대/상대/풀URL, .php 포함) 우선
+    for c in candidates:
+        cs = c.strip()
+        if cs.startswith(("/", "./", "../", "http://", "https://")):
+            return cs
+        if ".php" in cs:
+            return cs
+    return candidates[0].strip()
+
+
+def _is_real_delete_url(url: str) -> bool:
+    """URL이 실제 삭제 엔드포인트를 가리키는지 확인.
+    작성/수정 공용 엔드포인트(write_comment_update.php, write.php)를 잘못 잡아
+    '댓글을 입력하여 주십시오' 같은 오류를 받는 문제를 방지한다."""
+    if not url:
+        return False
+    u = url.lower()
+    # 댓글 전용 삭제 엔드포인트 또는 일반 delete.php 만 인정
+    return ("delete_comment" in u) or ("delete.php" in u)
+
+
 def _extract_display_name(el) -> str:
     """HTML 요소에서 작성자 표시 이름(닉네임/이름)을 추출한다.
     아이디 대신 닉네임 우선."""
@@ -764,9 +799,9 @@ def _parse_comments(soup: BeautifulSoup) -> list[CommentItem]:
                 h = a.get("href", "")
                 t = a.get_text(strip=True)
                 if "수정" in t or "edit_comment" in h:
-                    edit_url = h
+                    edit_url = _unwrap_js_url(h)
                 elif "삭제" in t or "delete_comment" in h:
-                    delete_url = h
+                    delete_url = _unwrap_js_url(h)
             footer.decompose()
         # 본인 댓글은 수정/삭제 버튼이 <ul>이나 inline a에 있을 수 있어 추가 제거
         for el in article.select("ul.btn_confirm, ul.comment_btns, .btn_area, .cmt_btn"):
@@ -774,9 +809,9 @@ def _parse_comments(soup: BeautifulSoup) -> list[CommentItem]:
                 h = a.get("href", "")
                 t = a.get_text(strip=True)
                 if not edit_url and ("수정" in t or "edit_comment" in h):
-                    edit_url = h
+                    edit_url = _unwrap_js_url(h)
                 if not delete_url and ("삭제" in t or "delete_comment" in h):
-                    delete_url = h
+                    delete_url = _unwrap_js_url(h)
             el.decompose()
 
         # <p> 태그들에서 정보 추출
@@ -911,9 +946,9 @@ def _extract_single_comment(el) -> CommentItem | None:
         h = a.get("href", "")
         t = a.get_text(strip=True)
         if "수정" in t or "edit" in h.lower():
-            edit_url = h
+            edit_url = _unwrap_js_url(h)
         elif "삭제" in t or "delete" in h.lower():
-            delete_url = h
+            delete_url = _unwrap_js_url(h)
 
     return CommentItem(author, date, body, comment_id, edit_url, delete_url)
 
@@ -1046,9 +1081,9 @@ def _parse_comment_elements(elements) -> list[CommentItem]:
             href = a_tag.get("href", "")
             a_text = a_tag.get_text(strip=True)
             if "수정" in a_text or "edit" in href.lower():
-                edit_url = href
+                edit_url = _unwrap_js_url(href)
             elif "삭제" in a_text or "delete" in href.lower():
-                delete_url = href
+                delete_url = _unwrap_js_url(href)
 
         comments.append(CommentItem(author, date, body, comment_id,
                                     edit_url, delete_url))

@@ -106,26 +106,18 @@ class ChorokMultiApp(wx.App):
                 pass
 
     def _play_startup_sound(self):
-        """시작 사운드 재생"""
+        """시작 사운드 재생 (사용자 설정 이벤트)."""
         try:
-            import winsound
-            sound_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "sounds", "startup.wav"
-            )
-            if os.path.exists(sound_path):
-                winsound.PlaySound(sound_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            from sound import play_event
+            play_event("program_start")
         except Exception:
             pass
 
     def _play_shutdown_sound(self):
-        """종료 사운드 재생"""
+        """종료 사운드 재생 (사용자 설정 이벤트, 동기)."""
         try:
-            import winsound
-            sound_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "sounds", "shutdown.wav"
-            )
-            if os.path.exists(sound_path):
-                winsound.PlaySound(sound_path, winsound.SND_FILENAME)
+            from sound import play_event
+            play_event("program_end", block=True)
         except Exception:
             pass
 

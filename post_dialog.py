@@ -16,6 +16,22 @@ from screen_reader import speak
 URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+')
 
 
+class ItemTextCtrl(wx.TextCtrl):
+    """특정 키를 네이티브 레벨에서 차단하는 TextCtrl.
+    댓글 목록처럼 한 줄만 표시하면서 좌/우·Ctrl+좌/우로 글자/단어 단위
+    기본 낭독을 받기 위해 사용."""
+
+    def MSWHandleMessage(self, msg, wParam, lParam):
+        WM_KEYDOWN = 0x0100
+        WM_CHAR = 0x0102
+        if msg in (WM_KEYDOWN, WM_CHAR):
+            # Home/End/Up/Down/Return/Back/PageUp/PageDn/Escape/Delete
+            blocked_vk = {0x24, 0x23, 0x26, 0x28, 0x0D, 0x08, 0x21, 0x22, 0x1B, 0x2E}
+            if wParam in blocked_vk:
+                return True, 0
+        return super().MSWHandleMessage(msg, wParam, lParam)
+
+
 def _extract_urls(text: str) -> list[tuple[int, int, str]]:
     """텍스트에서 모든 URL의 (시작, 끝, URL) 목록 반환."""
     if not text:
@@ -102,6 +118,8 @@ class PostDialog(wx.Dialog):
         self.has_comments = isinstance(content.comments, list) and len(content.comments) > 0
         self.comment_reversed = False
         self.navigate_result = ""  # "prev" or "next"
+        self._comment_index = 0
+        self._comment_displays: list[str] = []
 
         self.panel = wx.Panel(self)
         self.main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -172,10 +190,17 @@ class PostDialog(wx.Dialog):
                 self.panel,
                 label=f"댓글 ({len(self.content.comments)}개):",
             )
-            self.comment_list = wx.ListBox(
-                self.panel, style=wx.LB_SINGLE, name="댓글 목록",
+            # TextCtrl — 현재 선택된 댓글만 표시. 기존 ListBox와 비슷한 시각적
+            # 높이를 확보하기 위해 MULTILINE + 최소 높이. ItemTextCtrl이 Up/Down/
+            # Home/End/PageUp/Dn을 Windows 메시지 레벨에서 차단하므로 커서가 내부
+            # 줄 이동으로 빠질 걱정은 없다. 좌/우·Ctrl+좌/우만 TextCtrl 기본 동작 →
+            # 스크린리더가 글자/단어 단위로 자동 낭독한다.
+            self.comment_ctrl = ItemTextCtrl(
+                self.panel,
+                style=wx.TE_READONLY | wx.TE_MULTILINE | wx.TE_DONTWRAP,
+                name="댓글 목록",
             )
-            self.comment_list.Bind(wx.EVT_LISTBOX, self._on_comment_selected)
+            self.comment_ctrl.SetMinSize((-1, 120))
             self.comment_edit_btn = wx.Button(self.panel, label="댓글 수정(&M)")
             self.comment_edit_btn.Bind(wx.EVT_BUTTON, self.on_edit_comment)
             self.comment_delete_btn = wx.Button(self.panel, label="댓글 삭제 Alt+D")
@@ -232,7 +257,7 @@ class PostDialog(wx.Dialog):
         # 댓글
         if self.has_comments:
             s.Add(self.comment_label, 0, wx.LEFT | wx.RIGHT, 5)
-            s.Add(self.comment_list, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+            s.Add(self.comment_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
             cmt_btn_row = wx.BoxSizer(wx.HORIZONTAL)
             cmt_btn_row.Add(self.comment_edit_btn, 0, wx.RIGHT, 5)
             cmt_btn_row.Add(self.comment_delete_btn, 0)
@@ -367,23 +392,71 @@ class PostDialog(wx.Dialog):
 
         # C: 댓글 작성
         if keycode in (ord("C"), ord("c")) and not alt:
-            if focused == self.body_text or (self.has_comments and focused == self.comment_list):
+            if focused == self.body_text or (self.has_comments and focused == self.comment_ctrl):
                 self.on_write_comment()
                 return
 
         # Alt+D 또는 D: 댓글 삭제
         if keycode in (ord("D"), ord("d")):
-            if self.has_comments and (alt or focused == self.comment_list):
+            if self.has_comments and (alt or focused == self.comment_ctrl):
                 self.on_delete_comment()
                 return
 
         # N: 댓글 정렬 순서 변경 (댓글 목록에 포커스)
         if keycode in (ord("N"), ord("n")) and not alt:
-            if self.has_comments and focused == self.comment_list:
+            if self.has_comments and focused == self.comment_ctrl:
                 self.on_toggle_comment_sort()
                 return
 
+        # M: 댓글 수정 (댓글 목록에 포커스, Alt 없이)
+        if keycode in (ord("M"), ord("m")) and not alt and not ctrl:
+            if self.has_comments and focused == self.comment_ctrl:
+                self.on_edit_comment()
+                return
+
+        # 댓글 목록 TextCtrl: 위/아래 → 댓글 이동, Home/End → 처음/끝 댓글.
+        # 좌/우·Ctrl+좌/우는 TextCtrl 기본 동작(글자/단어 이동)이 스크린리더 낭독을
+        # 자동으로 발생시키므로 별도 처리하지 않고 event.Skip() 으로 흘려보낸다.
+        if self.has_comments and focused == self.comment_ctrl and not alt and not ctrl:
+            if keycode == wx.WXK_UP:
+                self._jump_to_comment(self._comment_index - 1)
+                return
+            if keycode == wx.WXK_DOWN:
+                self._jump_to_comment(self._comment_index + 1)
+                return
+            if keycode == wx.WXK_HOME:
+                self._jump_to_comment(0)
+                return
+            if keycode == wx.WXK_END:
+                self._jump_to_comment(len(self._comment_displays) - 1)
+                return
+
         event.Skip()
+
+    # ── 댓글 목록 이동 ──
+
+    def _jump_to_comment(self, new_index: int):
+        """댓글 목록에서 다른 댓글로 이동. SetValue 호출로 스크린리더가 자동 낭독."""
+        if not self._comment_displays:
+            return
+        n = len(self._comment_displays)
+        new_index = max(0, min(new_index, n - 1))
+        self._comment_index = new_index
+        self.comment_ctrl.SetValue(self._comment_displays[new_index])
+        self.comment_ctrl.SetInsertionPoint(0)
+        self._update_comment_buttons()
+
+    def _update_comment_buttons(self):
+        """현재 선택된 댓글의 수정/삭제 버튼 활성 상태 갱신."""
+        if not self.has_comments:
+            return
+        comment = self._get_selected_comment_raw(self._comment_index)
+        if comment:
+            self.comment_edit_btn.Enable(bool(comment.edit_url))
+            self.comment_delete_btn.Enable(bool(comment.delete_url))
+        else:
+            self.comment_edit_btn.Enable(False)
+            self.comment_delete_btn.Enable(False)
 
     # ── 댓글 정렬 ──
 
@@ -394,20 +467,6 @@ class PostDialog(wx.Dialog):
             speak("댓글 역순")
         else:
             speak("댓글 등록순")
-
-    def _on_comment_selected(self, event):
-        """댓글 선택 시 수정/삭제 버튼 활성화 상태 업데이트"""
-        comment = self._get_selected_comment()
-        if comment:
-            # 수정/삭제 URL이 있으면 본인 댓글로 판단
-            has_edit = bool(comment.edit_url)
-            has_delete = bool(comment.delete_url)
-            self.comment_edit_btn.Enable(has_edit)
-            self.comment_delete_btn.Enable(has_delete)
-        else:
-            self.comment_edit_btn.Enable(False)
-            self.comment_delete_btn.Enable(False)
-        event.Skip()
 
     def _refresh_comment_list(self):
         if not self.has_comments:
@@ -446,22 +505,33 @@ class PostDialog(wx.Dialog):
                         break
 
             if body:
-                display.append(f"{header} : {body}" if header else body)
+                raw = f"{header} : {body}" if header else body
             elif header:
-                display.append(header)
+                raw = header
             else:
-                display.append("(빈 댓글)")
-        self.comment_list.Set(display)
-        if display:
-            self.comment_list.SetSelection(0)
-            # 첫 댓글 선택에 따른 버튼 상태 업데이트
-            comment = self._get_selected_comment_raw(0)
-            if comment:
-                self.comment_edit_btn.Enable(bool(comment.edit_url))
-                self.comment_delete_btn.Enable(bool(comment.delete_url))
-            else:
-                self.comment_edit_btn.Enable(False)
-                self.comment_delete_btn.Enable(False)
+                raw = "(빈 댓글)"
+            # TextCtrl에 표시하므로 줄바꿈/탭은 공백으로 치환 (글자 낭독 시 잡음 방지)
+            raw = raw.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            raw = raw.replace("\t", " ")
+            display.append(raw)
+
+        total = len(display)
+        # 화면/스크린리더가 댓글 내용을 먼저 읽고, 위치 정보는 뒤에 읽도록 suffix.
+        # 좌/우 글자 이동 시작점도 댓글 본문 첫 글자가 되어 낭독이 자연스럽다.
+        display_with_index = [f"{text} ({i + 1}/{total})" for i, text in enumerate(display)]
+
+        self._comment_displays = display_with_index
+        if display_with_index:
+            # 현재 인덱스를 범위 내로 보정 (정렬 토글 후에도 동일 위치 유지)
+            self._comment_index = min(self._comment_index, len(display_with_index) - 1)
+            self.comment_ctrl.ChangeValue(display_with_index[self._comment_index])
+            self.comment_ctrl.SetInsertionPoint(0)
+            self._update_comment_buttons()
+        else:
+            self._comment_index = 0
+            self.comment_ctrl.ChangeValue("")
+            self.comment_edit_btn.Enable(False)
+            self.comment_delete_btn.Enable(False)
 
     def _get_selected_comment_raw(self, sel: int) -> CommentItem | None:
         """인덱스로 댓글 반환 (정렬 상태 반영)"""
@@ -476,15 +546,7 @@ class PostDialog(wx.Dialog):
         """현재 선택된 댓글 (정렬 상태 반영)"""
         if not self.has_comments:
             return None
-        sel = self.comment_list.GetSelection()
-        if sel == wx.NOT_FOUND:
-            return None
-        comments = self.content.comments
-        if self.comment_reversed:
-            comments = list(reversed(comments))
-        if sel < len(comments):
-            return comments[sel]
-        return None
+        return self._get_selected_comment_raw(self._comment_index)
 
     # ── 본문 저장 ──
 
@@ -541,10 +603,19 @@ class PostDialog(wx.Dialog):
 
         from config import get_download_dir
         from main_frame import download_list
+        try:
+            from sound import play_event
+        except Exception:
+            play_event = None
 
         download_dir = get_download_dir()
         total = len(self.content.files)
         speak(f"첨부파일 다운로드를 시작합니다. {total}개 파일")
+        if play_event:
+            try:
+                play_event("download_start")
+            except Exception:
+                pass
 
         def _beep(freq):
             try:
@@ -601,6 +672,11 @@ class PostDialog(wx.Dialog):
                 wx.CallAfter(speak, f"첨부파일 다운로드가 완료되었습니다. {success}개 파일")
             else:
                 wx.CallAfter(speak, f"다운로드 완료: 성공 {success}개, 실패 {fail}개")
+            if play_event:
+                try:
+                    play_event("download_complete")
+                except Exception:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -687,6 +763,226 @@ class PostDialog(wx.Dialog):
 
     # ── 댓글 삭제 ──
 
+    def _verify_comment_deleted(self, comment) -> bool:
+        """게시물을 다시 로드해서 해당 comment_id가 사라졌는지 확인.
+        서버가 응답 alert을 명확히 주지 않아도 실제 삭제 여부를 판정하기 위한 체크."""
+        if not (self.content.bo_table and self.content.wr_id and comment.comment_id):
+            return False
+        try:
+            vurl = (
+                f"{SORISEM_BASE_URL}/bbs/board.php"
+                f"?bo_table={self.content.bo_table}"
+                f"&wr_id={self.content.wr_id}"
+            )
+            vresp = self.session.get(vurl, timeout=15)
+            html = vresp.text or ""
+        except Exception:
+            return False
+        cid = comment.comment_id
+        # id="c_123" 형식의 article 속성만 검사 (본문 등에 숫자 ID가 우연히 들어가는
+        # 오탐 방지). 작은 따옴표 / 큰 따옴표 모두 대응.
+        if f'id="{cid}"' in html or f"id='{cid}'" in html:
+            return False
+        return True
+
+    def _attempt_comment_delete(self, comment, delete_url: str,
+                                allow_token_retry: bool) -> None:
+        """실제 댓글 삭제 요청 수행. alert 감지 → 실패 시 1회 재시도."""
+        import html as _html
+        import re as _re
+        from urllib.parse import urljoin, urlsplit, parse_qsl
+
+        if self.content.bo_table and self.content.wr_id:
+            referer = (
+                f"{SORISEM_BASE_URL}/bbs/board.php"
+                f"?bo_table={self.content.bo_table}"
+                f"&wr_id={self.content.wr_id}"
+            )
+        else:
+            referer = SORISEM_BASE_URL + "/"
+
+        raw = _html.unescape(delete_url or "")
+        if raw.startswith("//"):
+            url = "https:" + raw
+        elif raw.startswith(("http://", "https://")):
+            url = raw
+        else:
+            url = urljoin(referer, raw)
+
+        # URL이 write_comment_update.php 같은 공용 작성·수정 엔드포인트를 가리킨다면
+        # GET 요청이 "댓글을 입력하여 주십시오"로 반려되므로, 쿼리 파라미터를 그대로
+        # POST body로 옮겨서 재전송한다. (w=cd 같은 삭제 플래그가 URL에 들어 있음)
+        path_lower = urlsplit(url).path.lower()
+        is_write_endpoint = (
+            "write_comment_update.php" in path_lower
+            or "write_comment.php" in path_lower
+            or path_lower.endswith("/write.php")
+        )
+
+        try:
+            if is_write_endpoint:
+                parts = urlsplit(url)
+                params = dict(parse_qsl(parts.query, keep_blank_values=True))
+                # 최소한의 식별 정보 보강
+                if self.content.bo_table:
+                    params.setdefault("bo_table", self.content.bo_table)
+                if self.content.wr_id:
+                    params.setdefault("wr_id", str(self.content.wr_id))
+                if comment.comment_id:
+                    cid = comment.comment_id.replace("c_", "")
+                    params.setdefault("comment_id", cid)
+                post_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+                resp = self.session.post(
+                    post_url, data=params,
+                    headers={"Referer": referer},
+                    timeout=15, allow_redirects=True,
+                )
+            else:
+                resp = self.session.get(
+                    url, headers={"Referer": referer},
+                    timeout=15, allow_redirects=True,
+                )
+        except Exception as e:
+            wx.CallAfter(speak, f"댓글 삭제 실패. {e}")
+            wx.CallAfter(wx.MessageBox, f"댓글 삭제 실패.\n{e}",
+                         "오류", wx.OK | wx.ICON_ERROR)
+            return
+
+        body = resp.text or ""
+        alert_match = _re.search(r"""alert\(\s*['"]([^'"]+)['"]\s*\)""", body)
+
+        # 1. 명확한 성공 alert → 바로 완료 처리
+        if alert_match:
+            msg = alert_match.group(1)
+            if "삭제" in msg and ("되었" in msg or "완료" in msg):
+                self._finish_comment_delete(comment)
+                return
+
+        # 2. 서버 쪽 실제 삭제 여부를 확인 (alert이 모호하거나 HTTP 에러여도
+        #    POST/GET 과정에서 실제 삭제가 이루어졌을 수 있음).
+        if self._verify_comment_deleted(comment):
+            self._finish_comment_delete(comment)
+            return
+
+        # 3. 서버에서 아직 댓글이 남아 있음 → 실제 실패. 첫 시도면 재시도.
+        if allow_token_retry:
+            self._retry_comment_delete_with_fresh_token(comment)
+            return
+
+        # 4. 최종 실패 → 원인 표시
+        if alert_match:
+            msg = alert_match.group(1)
+            wx.CallAfter(speak, f"댓글 삭제 실패. {msg}")
+            wx.CallAfter(
+                wx.MessageBox,
+                f"댓글 삭제 실패.\n{msg}\n\n"
+                f"원본 링크: {delete_url}\n요청 URL: {url}",
+                "오류", wx.OK | wx.ICON_ERROR,
+            )
+            return
+        if resp.status_code >= 400:
+            wx.CallAfter(speak, f"댓글 삭제 실패. HTTP {resp.status_code}")
+            wx.CallAfter(
+                wx.MessageBox,
+                f"댓글 삭제 실패 (HTTP {resp.status_code})\n\n"
+                f"원본 링크: {delete_url}\n요청 URL: {url}",
+                "오류", wx.OK | wx.ICON_ERROR,
+            )
+            return
+        wx.CallAfter(speak, "댓글 삭제 실패.")
+        wx.CallAfter(
+            wx.MessageBox,
+            "서버에서 댓글이 삭제되지 않았습니다.\n"
+            f"원본 링크: {delete_url}\n요청 URL: {url}",
+            "오류", wx.OK | wx.ICON_ERROR,
+        )
+
+    def _finish_comment_delete(self, comment):
+        """삭제 후 목록/UI 갱신."""
+        try:
+            self.content.comments.remove(comment)
+        except ValueError:
+            pass
+        wx.CallAfter(self._refresh_comment_list)
+        wx.CallAfter(speak, "댓글이 삭제되었습니다.")
+        wx.CallAfter(wx.MessageBox, "댓글이 삭제되었습니다.",
+                     "완료", wx.OK | wx.ICON_INFORMATION)
+
+    def _retry_comment_delete_with_fresh_token(self, comment):
+        """토큰 에러 시 게시물을 재로드해서 이 댓글(comment_id)의 최신 delete URL을
+        뽑아낸 뒤 1회 재시도."""
+        speak("토큰을 갱신하여 다시 시도합니다.")
+
+        def worker():
+            import re as _re
+            import html as _html_mod
+            from page_parser import _unwrap_js_url
+
+            try:
+                post_url = (
+                    f"{SORISEM_BASE_URL}/bbs/board.php"
+                    f"?bo_table={self.content.bo_table}"
+                    f"&wr_id={self.content.wr_id}"
+                )
+                resp_page = self.session.get(post_url, timeout=15)
+                html = resp_page.text or ""
+
+                cid = comment.comment_id or ""
+                fresh_url = ""
+
+                # 1) comment_id 블록 범위에서 delete_comment 링크 탐색
+                if cid:
+                    block_match = _re.search(
+                        r'id=["\']' + _re.escape(cid) + r'["\'].*?</article>',
+                        html, _re.DOTALL,
+                    )
+                    if block_match:
+                        block = block_match.group(0)
+                        m = _re.search(
+                            r'href=["\']([^"\']*(?:delete_comment\.php|delete\.php)[^"\']*)["\']',
+                            block,
+                        )
+                        if m:
+                            fresh_url = _unwrap_js_url(_html_mod.unescape(m.group(1)))
+
+                # 2) fallback: delete_comment.php URL 중 comment_id 일치하는 것
+                if not fresh_url and cid:
+                    cid_num = cid.replace("c_", "")
+                    for m in _re.finditer(
+                        r'href=["\']([^"\']*delete_comment\.php[^"\']*)["\']',
+                        html,
+                    ):
+                        candidate = _html_mod.unescape(m.group(1))
+                        if f"comment_id={cid_num}" in candidate or f"comment_id={cid}" in candidate:
+                            fresh_url = _unwrap_js_url(candidate)
+                            break
+
+                if not fresh_url:
+                    # 페이지에서 delete_comment.php 링크를 못 찾았다면 이미 서버에서
+                    # 삭제되어 해당 comment_id가 사라졌을 가능성이 크다. 검증 후
+                    # 삭제됐으면 성공 처리, 아니면 오류 표시.
+                    if comment.comment_id and f'id="{comment.comment_id}"' not in html \
+                            and f"id='{comment.comment_id}'" not in html:
+                        self._finish_comment_delete(comment)
+                        return
+                    wx.CallAfter(speak, "삭제 URL을 찾을 수 없습니다.")
+                    wx.CallAfter(
+                        wx.MessageBox,
+                        "페이지에서 삭제 링크를 찾지 못했습니다.",
+                        "오류", wx.OK | wx.ICON_ERROR,
+                    )
+                    return
+
+                self._attempt_comment_delete(
+                    comment, fresh_url, allow_token_retry=False,
+                )
+            except Exception as e:
+                wx.CallAfter(speak, f"댓글 삭제 실패. {e}")
+                wx.CallAfter(wx.MessageBox, f"댓글 삭제 실패.\n{e}",
+                             "오류", wx.OK | wx.ICON_ERROR)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_delete_comment(self):
         comment = self._get_selected_comment()
         if not comment:
@@ -706,20 +1002,9 @@ class PostDialog(wx.Dialog):
         speak("댓글을 삭제하는 중입니다.")
 
         def worker():
-            try:
-                url = comment.delete_url
-                if not url.startswith("http"):
-                    url = f"{SORISEM_BASE_URL}{url}"
-                self.session.get(url, timeout=15)
-                self.content.comments.remove(comment)
-                wx.CallAfter(self._refresh_comment_list)
-                wx.CallAfter(speak, "댓글이 삭제되었습니다.")
-                wx.CallAfter(wx.MessageBox, "댓글이 삭제되었습니다.",
-                             "완료", wx.OK | wx.ICON_INFORMATION)
-            except Exception as e:
-                wx.CallAfter(speak, f"댓글 삭제 실패. {e}")
-                wx.CallAfter(wx.MessageBox, f"댓글 삭제 실패.\n{e}",
-                             "오류", wx.OK | wx.ICON_ERROR)
+            self._attempt_comment_delete(
+                comment, comment.delete_url, allow_token_retry=True,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 

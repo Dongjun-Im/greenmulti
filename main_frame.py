@@ -272,6 +272,38 @@ class MainFrame(wx.Frame):
         if self.current_items:
             speak(f"{APP_NAME}. {self.current_items[0]} 1/{len(self.current_items)}")
 
+        # UI가 뜬 뒤 NAS 자동 마운트 시도 (저장된 자격증명이 있을 때만, 백그라운드)
+        wx.CallLater(500, self._try_auto_mount_nas)
+
+    def _try_auto_mount_nas(self):
+        """저장된 NAS 자격증명이 있으면 백그라운드로 마운트 시도."""
+        try:
+            from nas import load_nas_credentials, mount, find_existing_mount
+        except Exception:
+            return
+
+        # 이미 마운트되어 있으면 재연결 불필요, 안내만
+        existing = find_existing_mount()
+        if existing:
+            speak("초록등대 자료실에 연결되었습니다.")
+            return
+
+        creds = load_nas_credentials()
+        if not creds:
+            return  # 저장된 자격증명 없음 → 조용히 패스
+        user, pw = creds
+
+        import threading
+
+        def worker():
+            ok, info = mount(user, pw)
+            if ok:
+                wx.CallAfter(speak, "초록등대 자료실에 연결되었습니다.")
+            # 실패 시 음성 안내하지 않음 (앱 시작 흐름을 방해하지 않도록).
+            # 사용자가 메뉴에서 직접 연결을 시도하면 에러 메시지를 표시.
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # ── 메뉴바 ──
 
     def _build_menu_bar(self):
@@ -323,15 +355,17 @@ class MainFrame(wx.Frame):
 
         # 설정 메뉴
         settings_menu = wx.Menu()
-        self.id_theme = wx.NewIdRef()
-        self.id_theme_cycle = wx.NewIdRef()
-        self.id_theme_cycle_back = wx.NewIdRef()
-        settings_menu.Append(self.id_theme, "화면 테마 선택(&T)\tF7")
-        settings_menu.Append(self.id_theme_cycle, "다음 테마로 변경(&N)\tF6")
-        settings_menu.Append(self.id_theme_cycle_back, "이전 테마로 변경(&P)\tShift+F6")
+        self.id_settings = wx.NewIdRef()
+        settings_menu.Append(self.id_settings, "설정(&T)\tF7")
         settings_menu.AppendSeparator()
         settings_menu.Append(self.id_download_dir, "다운로드 폴더 변경(&D)")
         menubar.Append(settings_menu, "설정(&S)")
+
+        # 도구 메뉴
+        tools_menu = wx.Menu()
+        self.id_nas_connect = wx.NewIdRef()
+        tools_menu.Append(self.id_nas_connect, "초록등대 자료실 연결(&N)\tCtrl+N")
+        menubar.Append(tools_menu, "도구(&T)")
 
         # 도움말 메뉴
         help_menu = wx.Menu()
@@ -363,10 +397,9 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_about, id=self.id_about)
         self.Bind(wx.EVT_MENU, self.on_shortcuts_help, id=self.id_shortcuts)
         self.Bind(wx.EVT_MENU, self.on_mail, id=self.id_mail)
-        self.Bind(wx.EVT_MENU, self.on_change_theme, id=self.id_theme)
-        self.Bind(wx.EVT_MENU, self.on_cycle_theme, id=self.id_theme_cycle)
-        self.Bind(wx.EVT_MENU, self.on_cycle_theme_back, id=self.id_theme_cycle_back)
+        self.Bind(wx.EVT_MENU, self.on_show_settings, id=self.id_settings)
         self.Bind(wx.EVT_MENU, self.on_board_refresh, id=self.id_board_refresh)
+        self.Bind(wx.EVT_MENU, self._on_menu_nas_connect, id=self.id_nas_connect)
 
     def _build_status_bar(self):
         self.status_bar = self.CreateStatusBar(2)
@@ -407,12 +440,11 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("J"), self.id_download_status),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("K"), self.id_shortcuts),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("L"), self.id_logout),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("N"), self.id_nas_connect),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("G"), self.id_goto),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F1, self.id_about),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F5, self.id_board_refresh),
-            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F6, self.id_theme_cycle),
-            wx.AcceleratorEntry(wx.ACCEL_SHIFT, wx.WXK_F6, self.id_theme_cycle_back),
-            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F7, self.id_theme),
+            wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F7, self.id_settings),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("E"), self.id_mail),
             # 글꼴 크기 단축키
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("="), self.id_zoom_in),
@@ -480,66 +512,22 @@ class MainFrame(wx.Frame):
         self._apply_full_theme()
         speak(f"글꼴 크기를 원래대로 되돌렸습니다. {DEFAULT_FONT_SIZE}")
 
-    def on_change_theme(self, event):
-        """화면 테마 변경 대화상자"""
-        current_key = load_theme_key()
-
-        # 테마 목록 구성
-        theme_names = []
-        for key in THEME_ORDER:
-            preset = THEME_PRESETS[key]
-            if key == current_key:
-                theme_names.append(f"{preset['name']} (현재)")
-            else:
-                theme_names.append(preset["name"])
-
-        current_idx = THEME_ORDER.index(current_key) if current_key in THEME_ORDER else 0
-
-        dlg = wx.SingleChoiceDialog(
-            self,
-            "사용할 화면 테마를 선택하세요.\n설정은 자동 저장됩니다.",
-            "화면 테마 변경 (F7)",
-            theme_names,
-        )
-        dlg.SetSelection(current_idx)
-
-        # 대화상자에도 테마 적용
+    def on_show_settings(self, event):
+        """F7: 통합 설정 대화상자 (테마 + 사운드)."""
         try:
-            apply_theme(dlg, make_font(self.current_font_size))
-        except Exception:
-            pass
-
-        if dlg.ShowModal() == wx.ID_OK:
-            sel = dlg.GetSelection()
-            new_key = THEME_ORDER[sel]
-            if new_key != current_key:
-                set_current_theme(new_key)
-                self._apply_full_theme()
-                new_name = THEME_PRESETS[new_key]["name"]
-                speak(f"테마가 {new_name}(으)로 변경되었습니다.")
-        dlg.Destroy()
-
-    def on_cycle_theme(self, event):
-        """F6: 다음 테마로 순환 변경 (음성 안내 포함)"""
-        self._cycle_theme(direction=1)
-
-    def on_cycle_theme_back(self, event):
-        """Shift+F6: 이전 테마로 순환 변경 (음성 안내 포함)"""
-        self._cycle_theme(direction=-1)
-
-    def _cycle_theme(self, direction: int):
-        """테마 순환 변경. direction=+1: 다음, -1: 이전"""
-        current_key = load_theme_key()
-        try:
-            idx = THEME_ORDER.index(current_key)
-        except ValueError:
-            idx = 0
-        next_idx = (idx + direction) % len(THEME_ORDER)
-        new_key = THEME_ORDER[next_idx]
-        set_current_theme(new_key)
-        self._apply_full_theme()
-        new_name = THEME_PRESETS[new_key]["name"]
-        speak(f"{new_name}")
+            from settings_dialog import SettingsDialog
+            dlg = SettingsDialog(self)
+            dlg.ShowModal()
+            dlg.Destroy()
+            self._apply_full_theme()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            speak(f"설정 대화상자를 여는 중 오류가 발생했습니다. {e}")
+            wx.MessageBox(
+                f"설정 대화상자 오류:\n{e}\n\n{traceback.format_exc()}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
 
     # ── 항목 표시 헬퍼 ──
 
@@ -707,6 +695,11 @@ class MainFrame(wx.Frame):
                 self.current_page = new_page
                 self._show_post_list(posts, self.current_menu_name,
                                      self.current_board_url, new_page)
+                try:
+                    from sound import play_event
+                    play_event("page_move")
+                except Exception:
+                    pass
             else:
                 # 디버그: HTML 응답 길이와 로그인 상태 확인
                 logged_in = "logout" in html.lower() or "로그아웃" in html
@@ -733,6 +726,11 @@ class MainFrame(wx.Frame):
         menu_names = self.menu_manager.get_display_names()
         self._update_textctrl(menu_names, "메뉴 목록")
         self.status_bar.SetStatusText("준비", 0)
+        try:
+            from sound import play_event
+            play_event("main_menu_return")
+        except Exception:
+            pass
 
     def _show_sub_menu(self, sub_menus: list[SubMenuItem], menu_name: str):
         self.current_view = VIEW_SUB_MENU
@@ -1031,11 +1029,21 @@ class MainFrame(wx.Frame):
         elif keycode == wx.WXK_HOME and not alt and not ctrl:
             if self.current_items:
                 self._jump_to_line_silent(0)
+                try:
+                    from sound import play_event
+                    play_event("home_end")
+                except Exception:
+                    pass
 
         # End: 마지막 항목으로 이동
         elif keycode == wx.WXK_END and not alt and not ctrl:
             if self.current_items:
                 self._jump_to_line_silent(len(self.current_items) - 1)
+                try:
+                    from sound import play_event
+                    play_event("home_end")
+                except Exception:
+                    pass
 
         # Shift+좌/우: 필드 읽기
         elif keycode == wx.WXK_LEFT and shift and not ctrl:
@@ -1328,6 +1336,11 @@ class MainFrame(wx.Frame):
         if menu_item is None:
             return
 
+        # NAS 자료실 연결: 마운트 상태에 따라 탐색기로 열거나, 자격증명 입력
+        if menu_item.type == "nas":
+            self._activate_nas_menu()
+            return
+
         # 외부 링크: 브라우저에서 열기
         if menu_item.is_external:
             import webbrowser
@@ -1340,6 +1353,58 @@ class MainFrame(wx.Frame):
             "selection": index,
         })
         self._load_and_show(menu_item.url, menu_item.name)
+
+    def _on_menu_nas_connect(self, event):
+        """메뉴바 '도구 > 초록등대 자료실 연결' 핸들러."""
+        self._activate_nas_menu()
+
+    def _activate_nas_menu(self):
+        """초록등대 자료실 연결. 이미 마운트되어 있으면 탐색기로 열기,
+        아니면 자격증명 입력 → 마운트 → 탐색기로 열기."""
+        try:
+            from nas import (
+                get_mounted_drive, open_in_explorer,
+                prompt_and_mount, load_nas_credentials, mount,
+            )
+        except Exception as e:
+            speak(f"NAS 모듈을 불러올 수 없습니다. {e}")
+            return
+
+        # 1) 이미 마운트: 탐색기로 열기
+        drive = get_mounted_drive()
+        if drive:
+            if open_in_explorer(drive):
+                speak(f"{drive} 드라이브를 엽니다.")
+            else:
+                speak("드라이브를 열 수 없습니다.")
+            return
+
+        # 2) 저장된 자격증명이 있으면 자동 시도 후 성공 시 열기
+        creds = load_nas_credentials()
+        if creds:
+            user, pw = creds
+            speak("초록등대 자료실에 연결 중입니다.")
+            ok, info = mount(user, pw)
+            if ok:
+                speak("초록등대 자료실에 연결되었습니다.")
+                open_in_explorer(info)
+                return
+            # 저장된 비밀번호로 실패하면 재입력 유도
+            wx.MessageBox(
+                f"저장된 자격증명으로 연결에 실패했습니다.\n다시 입력해 주세요.\n\n{info}",
+                "NAS 연결 실패", wx.OK | wx.ICON_WARNING, self,
+            )
+
+        # 3) 자격증명 입력 대화상자 → 마운트
+        ok, info = prompt_and_mount(self, speak_func=speak)
+        if ok:
+            from nas import open_in_explorer as _open
+            _open(info)
+        elif info and info != "취소되었습니다.":
+            wx.MessageBox(
+                f"NAS 연결 실패.\n{info}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
 
     def _activate_sub_menu(self, index: int):
         # 0번: 메인 메뉴로 돌아가기
@@ -2110,6 +2175,12 @@ class MainFrame(wx.Frame):
             try:
                 from green_auth.config import LOGOUT_URL
                 self.session.get(LOGOUT_URL, timeout=10)
+            except Exception:
+                pass
+            # NAS 마운트도 함께 해제
+            try:
+                from nas import unmount as _nas_unmount
+                _nas_unmount()
             except Exception:
                 pass
             speak("로그아웃되었습니다.")
