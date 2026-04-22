@@ -8,6 +8,10 @@ import os
 
 import wx
 
+from config import (
+    load_update_settings, save_update_settings, APP_VERSION,
+    UPDATE_INTERVALS, UPDATE_INTERVAL_KEYS,
+)
 from screen_reader import speak
 from sound import (
     SOUND_EVENTS, load_sound_settings, save_sound_settings,
@@ -260,7 +264,135 @@ class SoundPage(wx.Panel):
 CATEGORIES: list[tuple[str, str]] = [
     ("theme", "화면 테마"),
     ("sound", "사운드"),
+    ("update", "업데이트"),
 ]
+
+
+class UpdatePage(wx.Panel):
+    """자동 업데이트 설정 페이지."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.settings = load_update_settings()
+
+        version_label = wx.StaticText(
+            self, label=f"현재 설치된 버전: {APP_VERSION}",
+        )
+
+        self.check_cb = wx.CheckBox(
+            self, label="프로그램 시작 시 자동으로 업데이트 확인(&S)",
+        )
+        self.check_cb.SetValue(bool(self.settings.get("check_on_startup", True)))
+
+        # 릴리스 채널 라디오
+        channel_box = wx.StaticBox(self, label="릴리스 채널")
+        channel_sizer = wx.StaticBoxSizer(channel_box, wx.VERTICAL)
+        self.rb_stable = wx.RadioButton(
+            channel_box, label="정식 버전만(&A) — 안정적인 정식 릴리스만 받음",
+            style=wx.RB_GROUP,
+        )
+        self.rb_beta = wx.RadioButton(
+            channel_box, label="베타 포함(&B) — 정식 + 프리릴리스(테스트 버전) 모두 받음",
+        )
+        channel = self.settings.get("channel", "stable")
+        if channel == "beta":
+            self.rb_beta.SetValue(True)
+        else:
+            self.rb_stable.SetValue(True)
+        channel_sizer.Add(self.rb_stable, 0, wx.ALL, 4)
+        channel_sizer.Add(self.rb_beta, 0, wx.ALL, 4)
+
+        # 자동 확인 주기 — RadioBox (접근성 좋음: 키보드 탐색 + 그룹 낭독)
+        self._interval_keys = list(UPDATE_INTERVAL_KEYS)
+        interval_choices = [label for _, label, _ in UPDATE_INTERVALS]
+        self.interval_rb = wx.RadioBox(
+            self, label="자동 확인 주기(&I)",
+            choices=interval_choices,
+            majorDimension=1, style=wx.RA_SPECIFY_COLS,
+        )
+        cur_interval = self.settings.get("check_interval", "weekly")
+        try:
+            cur_idx = self._interval_keys.index(cur_interval)
+        except ValueError:
+            cur_idx = self._interval_keys.index("weekly")
+        self.interval_rb.SetSelection(cur_idx)
+
+        hint = wx.StaticText(
+            self,
+            label=(
+                "• 선택한 주기에 따라 자동 확인이 실행됩니다.\n"
+                "• 네트워크가 없으면 조용히 넘어갑니다.\n"
+                "• '지금 확인' 버튼으로 언제든지 바로 확인할 수 있습니다."
+            ),
+        )
+
+        # 건너뛴 버전 표시 / 초기화
+        skipped = self.settings.get("skip_version", "")
+        self._skip_label_text = (
+            f"건너뛴 버전: {skipped}" if skipped else "건너뛴 버전: (없음)"
+        )
+        self.skip_label = wx.StaticText(self, label=self._skip_label_text)
+        self.reset_skip_btn = wx.Button(self, label="건너뛴 버전 다시 알림(&R)")
+        self.reset_skip_btn.Enable(bool(skipped))
+        self.reset_skip_btn.Bind(wx.EVT_BUTTON, self._on_reset_skip)
+
+        # 지금 확인
+        self.check_now_btn = wx.Button(self, label="지금 업데이트 확인(&C)")
+        self.check_now_btn.Bind(wx.EVT_BUTTON, self._on_check_now)
+
+        # 마지막 체크 시각 표시
+        last = self.settings.get("last_check_iso", "")
+        self.last_check_label = wx.StaticText(
+            self,
+            label=f"마지막 확인: {last}" if last else "마지막 확인: (아직 없음)",
+        )
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(version_label, 0, wx.ALL, 8)
+        sizer.Add(self.check_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.Add(self.interval_rb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.Add(channel_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.Add(hint, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        sizer.AddSpacer(8)
+        sizer.Add(self.skip_label, 0, wx.LEFT | wx.RIGHT, 8)
+        sizer.Add(self.reset_skip_btn, 0, wx.ALL, 8)
+        sizer.AddSpacer(8)
+        sizer.Add(self.last_check_label, 0, wx.LEFT | wx.RIGHT, 8)
+        sizer.Add(self.check_now_btn, 0, wx.ALL, 8)
+        self.SetSizer(sizer)
+
+    def focus_default(self):
+        self.check_cb.SetFocus()
+
+    def _on_reset_skip(self, event):
+        s = load_update_settings()
+        s["skip_version"] = ""
+        save_update_settings(s)
+        self.settings = s
+        self.skip_label.SetLabel("건너뛴 버전: (없음)")
+        self.reset_skip_btn.Enable(False)
+        speak("건너뛴 버전을 해제했습니다.")
+
+    def _on_check_now(self, event):
+        # 메인 프레임의 수동 체크 경로를 재사용.
+        top = wx.GetTopLevelParent(self)
+        # SettingsDialog 의 부모 프레임을 찾아 거슬러 올라간다.
+        frame = top.GetParent() if isinstance(top, wx.Dialog) else top
+        runner = getattr(frame, "on_manual_update_check", None)
+        if callable(runner):
+            speak("업데이트를 확인합니다.")
+            runner(None)
+        else:
+            speak("업데이트 확인 기능을 찾을 수 없습니다.")
+
+    def collect(self) -> dict:
+        s = load_update_settings()
+        s["check_on_startup"] = bool(self.check_cb.GetValue())
+        s["channel"] = "beta" if self.rb_beta.GetValue() else "stable"
+        idx = self.interval_rb.GetSelection()
+        if 0 <= idx < len(self._interval_keys):
+            s["check_interval"] = self._interval_keys[idx]
+        return s
 
 
 class SettingsDialog(wx.Dialog):
@@ -286,8 +418,10 @@ class SettingsDialog(wx.Dialog):
         self.book = wx.Simplebook(self)
         self.theme_page = ThemePage(self.book)
         self.sound_page = SoundPage(self.book)
+        self.update_page = UpdatePage(self.book)
         self.book.AddPage(self.theme_page, "화면 테마")
         self.book.AddPage(self.sound_page, "사운드")
+        self.book.AddPage(self.update_page, "업데이트")
         self.book.SetSelection(0)
 
         # 하단 버튼
@@ -344,11 +478,15 @@ class SettingsDialog(wx.Dialog):
         self.category_list.SetFocus()
 
     def _on_ok(self, event):
-        # 테마는 ThemePage 선택 즉시 저장+적용됨. 여기선 사운드만 저장.
+        # 테마는 ThemePage 선택 즉시 저장+적용됨. 여기선 사운드·업데이트만 저장.
         try:
             save_sound_settings(self.sound_page.collect())
         except Exception as e:
             speak(f"사운드 설정 저장 실패. {e}")
+        try:
+            save_update_settings(self.update_page.collect())
+        except Exception as e:
+            speak(f"업데이트 설정 저장 실패. {e}")
         self.EndModal(wx.ID_OK)
 
     def _on_cancel(self, event):

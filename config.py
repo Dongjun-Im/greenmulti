@@ -47,6 +47,24 @@ DOWNLOAD_DIR_FILE = os.path.join(DATA_DIR, "download_dir.txt")
 SEARCH_HISTORY_FILE = os.path.join(DATA_DIR, "search_history.json")
 SEARCH_HISTORY_MAX = 10
 
+# 자동 업데이트
+UPDATE_REPO = "Dongjun-Im/greenmulti"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_LIST_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases"
+UPDATE_RELEASES_PAGE = f"https://github.com/{UPDATE_REPO}/releases/latest"
+UPDATE_SETTINGS_FILE = os.path.join(DATA_DIR, "update_settings.json")
+# 릴리스 채널: "stable"(정식만) / "beta"(pre-release 포함)
+UPDATE_CHANNELS = ("stable", "beta")
+
+# 업데이트 자동 확인 주기. 키 → (표시 이름, 간격 시간(0=항상))
+UPDATE_INTERVALS = (
+    ("always",   "실행할 때마다", 0),
+    ("weekly",   "1주에 한 번",    24 * 7),
+    ("biweekly", "2주에 한 번",    24 * 14),
+    ("monthly",  "1달에 한 번",    24 * 30),
+)
+UPDATE_INTERVAL_KEYS = tuple(k for k, _, _ in UPDATE_INTERVALS)
+
 def get_download_dir() -> str:
     """다운로드 폴더 경로 반환"""
     if os.path.exists(DOWNLOAD_DIR_FILE):
@@ -101,6 +119,64 @@ def add_search_history(query: str, type_name: str):
         os.makedirs(os.path.dirname(SEARCH_HISTORY_FILE), exist_ok=True)
         with open(SEARCH_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+def load_update_settings() -> dict:
+    """업데이트 설정 로드.
+
+    반환 키:
+        check_on_startup (bool): 시작 시 자동 확인 (기본 True)
+        skip_version (str): "v1.5.0"처럼 사용자가 건너뛰기 선택한 버전
+        last_check_iso (str): 마지막 자동 체크 성공 시각 ISO-8601 ("" 이면 체크한 적 없음)
+    """
+    import json
+    defaults = {
+        "check_on_startup": True,
+        "skip_version": "",
+        "last_check_iso": "",
+        "channel": "stable",
+        "check_interval": "weekly",
+    }
+    if not os.path.exists(UPDATE_SETTINGS_FILE):
+        return defaults
+    try:
+        with open(UPDATE_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return defaults
+        channel = str(data.get("channel", "stable"))
+        if channel not in UPDATE_CHANNELS:
+            channel = "stable"
+        interval = str(data.get("check_interval", "weekly"))
+        if interval not in UPDATE_INTERVAL_KEYS:
+            interval = "weekly"
+        defaults.update({
+            "check_on_startup": bool(data.get("check_on_startup", True)),
+            "skip_version": str(data.get("skip_version", "")),
+            "last_check_iso": str(data.get("last_check_iso", "")),
+            "channel": channel,
+            "check_interval": interval,
+        })
+        return defaults
+    except (OSError, ValueError):
+        return defaults
+
+
+def get_update_interval_hours(key: str) -> float:
+    """UPDATE_INTERVALS 에서 해당 키의 시간(시간 단위) 반환. 미지의 키는 주 단위."""
+    for k, _, hours in UPDATE_INTERVALS:
+        if k == key:
+            return float(hours)
+    return 24.0 * 7
+
+def save_update_settings(settings: dict):
+    """업데이트 설정 저장."""
+    import json
+    try:
+        os.makedirs(os.path.dirname(UPDATE_SETTINGS_FILE), exist_ok=True)
+        with open(UPDATE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 

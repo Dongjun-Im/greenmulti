@@ -1,6 +1,7 @@
 """초록멀티 메인 프레임"""
 import os
 import re
+import sys
 import threading
 import webbrowser
 
@@ -14,6 +15,16 @@ from config import (
     DATA_DIR,
     load_search_history, add_search_history,
     resource_path,
+    load_update_settings, save_update_settings, UPDATE_RELEASES_PAGE,
+    get_update_interval_hours,
+)
+from updater import (
+    check_latest_release, is_newer, ReleaseInfo,
+    download_installer, get_download_dir, DownloadCancelled,
+    ChecksumMismatch, sha256_of_file, fetch_expected_checksum,
+    clean_release_notes,
+    detect_installation_kind, get_install_dir, fetch_manifest, compute_delta,
+    extract_zip, write_restart_script,
 )
 from menu_manager import MenuManager
 from page_parser import (
@@ -277,6 +288,10 @@ class MainFrame(wx.Frame):
         # UI가 뜬 뒤 NAS 자동 마운트 시도 (저장된 자격증명이 있을 때만, 백그라운드)
         wx.CallLater(500, self._try_auto_mount_nas)
 
+        # 시작 시 자동 업데이트 확인 (설정에서 끌 수 있음). 로그인/메뉴 음성이
+        # 먼저 끝나도록 몇 초 지연 후 백그라운드로 실행.
+        wx.CallLater(3000, self._auto_update_check)
+
     def _try_auto_mount_nas(self):
         """저장된 NAS 자격증명이 있으면 백그라운드로 rclone 마운트 시도."""
         try:
@@ -412,9 +427,12 @@ class MainFrame(wx.Frame):
         self.id_shortcuts = wx.NewIdRef()
         self.id_mail = wx.NewIdRef()
         self.id_manual = wx.NewIdRef()
+        self.id_update_check = wx.NewIdRef()
         help_menu.Append(self.id_about, "프로그램 정보(&A)\tF1")
         help_menu.Append(self.id_manual, "사용자 설명서(&U)\tShift+F1")
         help_menu.Append(self.id_shortcuts, "단축키 안내(&K)\tCtrl+K")
+        help_menu.AppendSeparator()
+        help_menu.Append(self.id_update_check, "업데이트 확인(&P)\tAlt+U")
         help_menu.AppendSeparator()
         help_menu.Append(self.id_mail, "관리자에게 메일 보내기(&E)\tAlt+E")
         menubar.Append(help_menu, "도움말(&H)")
@@ -439,6 +457,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_show_manual, id=self.id_manual)
         self.Bind(wx.EVT_MENU, self.on_shortcuts_help, id=self.id_shortcuts)
         self.Bind(wx.EVT_MENU, self.on_mail, id=self.id_mail)
+        self.Bind(wx.EVT_MENU, self.on_manual_update_check, id=self.id_update_check)
         self.Bind(wx.EVT_MENU, self.on_show_settings, id=self.id_settings)
         self.Bind(wx.EVT_MENU, self.on_board_refresh, id=self.id_board_refresh)
         self.Bind(wx.EVT_MENU, self._on_menu_nas_connect, id=self.id_nas_connect)
@@ -486,6 +505,7 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("G"), self.id_goto),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F1, self.id_about),
             wx.AcceleratorEntry(wx.ACCEL_SHIFT, wx.WXK_F1, self.id_manual),
+            wx.AcceleratorEntry(wx.ACCEL_ALT, ord("U"), self.id_update_check),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F5, self.id_board_refresh),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F7, self.id_settings),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("E"), self.id_mail),
@@ -2330,6 +2350,655 @@ class MainFrame(wx.Frame):
 
     # ── 프로그램 정보 (F1) ──
 
+    # ── 자동 업데이트 ──
+
+    def _auto_update_check(self):
+        """시작 시 백그라운드 업데이트 확인. 설정으로 끌 수 있음.
+
+        사용자가 선택한 주기(실행 때마다/1주/2주/1달) 이내면 건너뜀.
+        건너뛰기 선택한 버전은 알림 안 띄움.
+        """
+        settings = load_update_settings()
+        if not settings.get("check_on_startup", True):
+            return
+        interval_hours = get_update_interval_hours(
+            settings.get("check_interval", "weekly")
+        )
+        if interval_hours > 0 and self._is_recently_checked(
+            settings.get("last_check_iso", ""), interval_hours
+        ):
+            return
+        self._run_update_check(manual=False)
+
+    @staticmethod
+    def _is_recently_checked(last_iso: str, min_interval_hours: float) -> bool:
+        """마지막 체크가 min_interval_hours 이내면 True."""
+        if not last_iso:
+            return False
+        try:
+            from datetime import datetime, timedelta
+            last = datetime.fromisoformat(last_iso)
+            return datetime.now() - last < timedelta(hours=min_interval_hours)
+        except (TypeError, ValueError):
+            return False
+
+    def on_manual_update_check(self, event):
+        """도움말 > 업데이트 확인 / Ctrl+Shift+U."""
+        speak("업데이트를 확인하는 중입니다.")
+        self._run_update_check(manual=True)
+
+    def _run_update_check(self, manual: bool):
+        """실제 조회는 백그라운드 스레드에서.
+
+        manual=True 이면 "최신 버전입니다" / 네트워크 실패 메시지도 표시.
+        manual=False 이면 새 버전 있을 때만 알림.
+        """
+        channel = load_update_settings().get("channel", "stable")
+
+        def worker():
+            info = check_latest_release(channel=channel)
+            wx.CallAfter(self._on_update_check_done, info, manual)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_done(self, info, manual: bool):
+        if info is None:
+            if manual:
+                speak("업데이트 정보를 확인할 수 없습니다.")
+                wx.MessageBox(
+                    "업데이트 서버에 연결할 수 없습니다.\n"
+                    "인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+                    "업데이트 확인 실패",
+                    wx.OK | wx.ICON_WARNING, self,
+                )
+            return
+
+        # 성공적인 조회는 last_check 에 기록 (하루 1회 제한 판단용)
+        from datetime import datetime
+        s = load_update_settings()
+        s["last_check_iso"] = datetime.now().isoformat(timespec="seconds")
+        save_update_settings(s)
+
+        if not is_newer(APP_VERSION, info.version):
+            if manual:
+                speak(f"현재 버전이 최신입니다. {APP_VERSION}")
+                wx.MessageBox(
+                    f"현재 사용 중인 버전이 최신입니다.\n"
+                    f"설치 버전: {APP_VERSION}\n"
+                    f"최신 버전: {info.version}",
+                    "최신 버전 사용 중",
+                    wx.OK | wx.ICON_INFORMATION, self,
+                )
+            return
+
+        # 자동 체크 + 이 버전 건너뛰기 선택한 경우는 조용히 종료
+        if not manual:
+            skipped = s.get("skip_version", "")
+            if skipped and skipped == info.version:
+                return
+
+        # 릴리스 노트를 사용자 친화적으로 정리
+        info.body = clean_release_notes(info.body)
+        self._show_update_dialog(info)
+
+    def _show_update_dialog(self, info):
+        """새 버전 안내 대화상자."""
+        dlg = UpdateDialog(self, info, APP_VERSION, self.current_font_size)
+        try:
+            apply_theme(dlg, make_font(self.current_font_size))
+        except Exception:
+            pass
+        speak(f"새 버전 {info.version}이 있습니다. 업데이트하시겠습니까?")
+        result = dlg.ShowModal()
+        dlg.Destroy()
+
+        if result == UpdateDialog.RESULT_UPDATE_NOW:
+            self._start_update_download(info)
+        elif result == UpdateDialog.RESULT_SKIP_VERSION:
+            s = load_update_settings()
+            s["skip_version"] = info.version
+            save_update_settings(s)
+            speak(f"버전 {info.version}을 건너뜁니다.")
+        # RESULT_LATER 또는 취소는 아무것도 저장하지 않음
+
+    def _start_update_download(self, info: ReleaseInfo):
+        """설치 종류에 따라 설치 파일 / ZIP / 델타 중 적절한 경로 선택."""
+        kind = detect_installation_kind()
+
+        # 설치형: 기존 .exe 설치 경로 사용
+        if kind == "installed" and info.installer_url:
+            self._download_and_install_exe(info)
+            return
+
+        # 포터블: manifest 가 있으면 델타, 없으면 ZIP 전체 교체
+        if kind == "portable":
+            if info.manifest_url and info.zip_url:
+                self._download_portable_delta(info)
+                return
+            if info.zip_url:
+                self._download_portable_full(info)
+                return
+
+        # 설치형인데 installer_url 이 없거나, 포터블인데 zip 도 없을 때
+        if info.installer_url:
+            self._download_and_install_exe(info)
+            return
+
+        speak("다운로드 가능한 업데이트 파일이 없습니다.")
+        url = info.html_url or UPDATE_RELEASES_PAGE
+        wx.MessageBox(
+            "이 릴리스에 자동 설치 가능한 파일이 첨부되지 않았습니다.\n"
+            "브라우저로 릴리스 페이지를 열어 직접 받아 주세요.",
+            "설치 파일 없음", wx.OK | wx.ICON_WARNING, self,
+        )
+        webbrowser.open(url)
+
+    def _download_and_install_exe(self, info: ReleaseInfo):
+        """설치형 업데이트: .exe 다운로드 후 SILENT 설치."""
+        dest_dir = get_download_dir()
+        file_name = info.installer_name or f"chorok_multi_{info.version}_setup.exe"
+        dest_path = os.path.join(dest_dir, file_name)
+
+        total_mb = info.installer_size / (1024 * 1024) if info.installer_size else 0
+        initial_msg = (
+            f"{file_name} 다운로드 준비 중..."
+            if total_mb == 0
+            else f"{file_name}\n약 {total_mb:.1f} MB 다운로드 준비 중..."
+        )
+        progress_dlg = wx.ProgressDialog(
+            "업데이트 다운로드",
+            initial_msg,
+            maximum=1000,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT
+                  | wx.PD_ELAPSED_TIME | wx.PD_REMAINING_TIME
+                  | wx.PD_AUTO_HIDE,
+        )
+
+        state = {"cancelled": False, "error": None, "path": None}
+
+        def progress_cb(downloaded: int, total: int) -> bool:
+            # 워커 스레드에서 호출됨. UI 갱신은 CallAfter.
+            def ui_update():
+                if state["cancelled"]:
+                    return
+                if total > 0:
+                    ratio = downloaded / total
+                    value = min(999, int(ratio * 1000))
+                    msg = (
+                        f"{file_name}\n"
+                        f"{downloaded / (1024*1024):.1f} MB / "
+                        f"{total / (1024*1024):.1f} MB"
+                    )
+                else:
+                    value = 0
+                    msg = f"{file_name}\n{downloaded / (1024*1024):.1f} MB 다운로드 중..."
+                keep_going, _ = progress_dlg.Update(value, msg)
+                if not keep_going:
+                    state["cancelled"] = True
+            wx.CallAfter(ui_update)
+            return not state["cancelled"]
+
+        def worker():
+            try:
+                path = download_installer(
+                    info.installer_url, dest_path, progress_cb=progress_cb,
+                )
+                state["path"] = path
+            except DownloadCancelled:
+                state["cancelled"] = True
+            except Exception as e:
+                state["error"] = str(e)
+            finally:
+                wx.CallAfter(on_finished)
+
+        def on_finished():
+            try:
+                progress_dlg.Destroy()
+            except Exception:
+                pass
+
+            if state["cancelled"]:
+                speak("업데이트를 취소했습니다.")
+                return
+
+            if state["error"]:
+                speak("업데이트 다운로드에 실패했습니다.")
+                wx.MessageBox(
+                    f"설치 파일을 내려받지 못했습니다.\n{state['error']}\n\n"
+                    f"브라우저에서 직접 내려받으시려면 '확인'을 누르세요.",
+                    "다운로드 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                webbrowser.open(info.html_url or UPDATE_RELEASES_PAGE)
+                return
+
+            if state["path"] and os.path.exists(state["path"]):
+                if not self._verify_download(state["path"], info):
+                    return
+                self._launch_installer(state["path"])
+
+        speak("업데이트를 내려받는 중입니다.")
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _verify_download(self, path: str, info: ReleaseInfo) -> bool:
+        """다운로드 파일의 SHA256 을 릴리스 체크섬과 비교.
+
+        - 체크섬 자산이 없으면 검증 건너뛰고 True 반환 (기존 호환성).
+        - 검증 실패 시 파일 삭제, 사용자 경고, False 반환.
+        """
+        # 크기 1차 검증 (content-length 기준)
+        if info.installer_size > 0:
+            try:
+                actual = os.path.getsize(path)
+            except OSError:
+                actual = 0
+            if actual != info.installer_size:
+                speak("다운로드된 파일의 크기가 일치하지 않습니다.")
+                wx.MessageBox(
+                    f"다운로드된 파일 크기가 예상과 다릅니다.\n"
+                    f"예상: {info.installer_size:,} 바이트\n"
+                    f"실제: {actual:,} 바이트\n\n"
+                    f"다시 시도해 주세요.",
+                    "다운로드 검증 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                try: os.remove(path)
+                except OSError: pass
+                return False
+
+        # 체크섬 검증 (자산이 있을 때만)
+        if not info.checksum_url:
+            return True
+        try:
+            expected = fetch_expected_checksum(info.checksum_url, info.installer_name)
+        except Exception:
+            expected = None
+        if not expected:
+            # 체크섬 파일은 있었지만 파싱 실패 — 조용히 스킵
+            return True
+        try:
+            actual_hash = sha256_of_file(path)
+        except OSError as e:
+            wx.MessageBox(
+                f"설치 파일을 읽는 중 오류가 발생했습니다.\n{e}",
+                "검증 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return False
+        if actual_hash.lower() != expected.lower():
+            speak("다운로드된 파일의 무결성 검증에 실패했습니다.")
+            wx.MessageBox(
+                "다운로드된 파일의 SHA256 체크섬이 릴리스와 일치하지 않습니다.\n"
+                "파일이 전송 중 손상되었거나 변조되었을 수 있습니다.\n"
+                "파일을 삭제합니다. 다시 시도해 주세요.\n\n"
+                f"예상: {expected}\n"
+                f"실제: {actual_hash}",
+                "무결성 검증 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            try: os.remove(path)
+            except OSError: pass
+            return False
+        return True
+
+    def _launch_installer(self, installer_path: str):
+        """내려받은 설치 파일 실행. 사용자 확인 후 초록멀티를 종료."""
+        ans = wx.MessageBox(
+            "다운로드가 완료되었습니다.\n"
+            "설치 프로그램을 실행하면 초록멀티가 종료되고\n"
+            "새 버전이 설치됩니다. 지금 설치하시겠습니까?",
+            "업데이트 설치",
+            wx.YES_NO | wx.ICON_INFORMATION, self,
+        )
+        if ans != wx.YES:
+            speak("설치 파일이 준비되었습니다. 다음 실행 시 다시 안내할 수 있습니다.")
+            return
+
+        try:
+            # Inno Setup 인자: /SILENT(마법사 없이 설치 진행), /CLOSEAPPLICATIONS
+            # (실행 중인 초록멀티를 설치 프로그램이 자동 종료), /RESTARTAPPLICATIONS
+            # (설치 후 자동 재시작). 비-Inno 설치 파일이어도 해당 인자는 무시됨.
+            import subprocess
+            subprocess.Popen(
+                [installer_path, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+                close_fds=True,
+            )
+        except Exception as e:
+            wx.MessageBox(
+                f"설치 프로그램을 실행하지 못했습니다.\n{e}\n\n"
+                f"내려받은 파일 위치:\n{installer_path}",
+                "설치 실행 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        speak("설치를 시작합니다. 초록멀티를 종료합니다.")
+        # 짧게 대기 후 프레임 닫기 → OnExit → MainLoop 종료
+        wx.CallLater(800, self.Close)
+
+    # ── 포터블 업데이트 ──
+
+    def _download_portable_full(self, info: ReleaseInfo):
+        """포터블 전체 ZIP 다운로드 → 추출 → 재시작 스크립트."""
+        dest_dir = get_download_dir()
+        file_name = info.zip_name or f"chorok_multi_{info.version}.zip"
+        dest_path = os.path.join(dest_dir, file_name)
+
+        total_mb = info.zip_size / (1024 * 1024) if info.zip_size else 0
+        initial_msg = (
+            f"{file_name} 다운로드 준비 중..."
+            if total_mb == 0
+            else f"{file_name}\n약 {total_mb:.1f} MB 다운로드 준비 중..."
+        )
+        progress_dlg = wx.ProgressDialog(
+            "포터블 업데이트 다운로드",
+            initial_msg,
+            maximum=1000, parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT
+                  | wx.PD_ELAPSED_TIME | wx.PD_REMAINING_TIME
+                  | wx.PD_AUTO_HIDE,
+        )
+        state = {"cancelled": False, "error": None, "path": None}
+
+        def progress_cb(downloaded, total):
+            def ui():
+                if state["cancelled"]:
+                    return
+                if total > 0:
+                    value = min(999, int(downloaded / total * 1000))
+                    msg = (
+                        f"{file_name}\n"
+                        f"{downloaded / (1024*1024):.1f} MB / "
+                        f"{total / (1024*1024):.1f} MB"
+                    )
+                else:
+                    value = 0
+                    msg = f"{file_name}\n{downloaded / (1024*1024):.1f} MB 다운로드 중..."
+                keep_going, _ = progress_dlg.Update(value, msg)
+                if not keep_going:
+                    state["cancelled"] = True
+            wx.CallAfter(ui)
+            return not state["cancelled"]
+
+        def worker():
+            try:
+                path = download_installer(info.zip_url, dest_path, progress_cb=progress_cb)
+                state["path"] = path
+            except DownloadCancelled:
+                state["cancelled"] = True
+            except Exception as e:
+                state["error"] = str(e)
+            finally:
+                wx.CallAfter(on_finished)
+
+        def on_finished():
+            try:
+                progress_dlg.Destroy()
+            except Exception:
+                pass
+            if state["cancelled"]:
+                speak("업데이트를 취소했습니다.")
+                return
+            if state["error"]:
+                speak("포터블 업데이트 다운로드에 실패했습니다.")
+                wx.MessageBox(
+                    f"ZIP 파일을 내려받지 못했습니다.\n{state['error']}",
+                    "다운로드 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                return
+            self._apply_portable_update(info, state["path"], delta_paths=None)
+
+        speak("포터블 업데이트를 내려받는 중입니다.")
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_portable_delta(self, info: ReleaseInfo):
+        """델타 업데이트: manifest 비교 → 변경된 파일만 ZIP 에서 추출."""
+        speak("변경된 파일 목록을 확인 중입니다.")
+
+        def worker():
+            manifest = fetch_manifest(info.manifest_url)
+            if manifest is None:
+                wx.CallAfter(
+                    self._on_delta_fallback, info,
+                    "매니페스트를 불러올 수 없어 전체 ZIP 업데이트로 전환합니다.",
+                )
+                return
+            install_dir = get_install_dir()
+            delta = compute_delta(install_dir, manifest)
+            wx.CallAfter(self._on_delta_ready, info, manifest, delta)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_delta_fallback(self, info: ReleaseInfo, reason: str):
+        speak(reason)
+        self._download_portable_full(info)
+
+    def _on_delta_ready(self, info: ReleaseInfo, manifest: dict, delta: list):
+        if not delta:
+            speak("이미 최신 상태입니다.")
+            wx.MessageBox(
+                "변경된 파일이 없습니다. 이미 최신 상태입니다.",
+                "업데이트 불필요", wx.OK | wx.ICON_INFORMATION, self,
+            )
+            # last_check 도 이미 갱신되었으므로 종료
+            return
+
+        total_files = len(manifest.get("files") or [])
+        delta_files = len(delta)
+        # 델타가 전체의 70% 넘으면 전체 ZIP 교체가 효율적
+        if total_files > 0 and delta_files / total_files > 0.7:
+            speak("변경된 파일이 많아 전체 업데이트로 전환합니다.")
+            self._download_portable_full(info)
+            return
+
+        ans = wx.MessageBox(
+            f"변경된 파일 {delta_files}개를 내려받아 교체합니다.\n"
+            f"(전체 {total_files}개 중 {delta_files}개)\n\n"
+            f"계속하시겠습니까?",
+            "델타 업데이트",
+            wx.YES_NO | wx.ICON_INFORMATION, self,
+        )
+        if ans != wx.YES:
+            return
+
+        delta_paths = [d["path"] for d in delta]
+        self._download_portable_full_inner(info, delta_paths=delta_paths, manifest=manifest)
+
+    def _apply_portable_update(
+        self, info: ReleaseInfo, zip_path, delta_paths=None, manifest=None,
+    ):
+        """내려받은 ZIP 을 풀고 재시작 스크립트 실행.
+
+        delta_paths 가 None 이면 전체 추출, 리스트면 해당 파일만 추출.
+        """
+        if not zip_path or not os.path.exists(zip_path):
+            wx.MessageBox(
+                "내려받은 파일을 찾을 수 없습니다.", "업데이트 실패",
+                wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        install_dir = get_install_dir()
+        staging_dir = os.path.join(get_download_dir(), f"staging_{info.version}")
+        # 이전 staging 정리
+        try:
+            if os.path.isdir(staging_dir):
+                import shutil
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            os.makedirs(staging_dir, exist_ok=True)
+        except OSError as e:
+            wx.MessageBox(
+                f"임시 폴더를 준비하지 못했습니다.\n{e}",
+                "업데이트 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        # 압축 해제 진행률 창
+        extract_dlg = wx.ProgressDialog(
+            "업데이트 압축 해제",
+            "파일을 풀어내는 중입니다...",
+            maximum=1000, parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_ELAPSED_TIME | wx.PD_AUTO_HIDE,
+        )
+        extract_state = {"cancelled": False, "error": None}
+
+        def xprog(done, total):
+            def ui():
+                if total > 0:
+                    extract_dlg.Update(
+                        min(999, int(done / total * 1000)),
+                        f"{done} / {total} 파일 처리 중",
+                    )
+                else:
+                    extract_dlg.Pulse(f"{done} 파일 처리 중")
+            wx.CallAfter(ui)
+            return not extract_state["cancelled"]
+
+        def work():
+            try:
+                extract_zip(zip_path, staging_dir, only_paths=delta_paths, progress_cb=xprog)
+            except Exception as e:
+                extract_state["error"] = str(e)
+            finally:
+                wx.CallAfter(done)
+
+        def done():
+            try:
+                extract_dlg.Destroy()
+            except Exception:
+                pass
+            if extract_state["error"]:
+                speak("압축 해제에 실패했습니다.")
+                wx.MessageBox(
+                    f"압축 해제에 실패했습니다.\n{extract_state['error']}",
+                    "업데이트 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                return
+            self._finalize_portable_update(info, staging_dir, manifest=manifest)
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _download_portable_full_inner(self, info: ReleaseInfo, delta_paths=None, manifest=None):
+        """ZIP 다운로드 + 델타 추출 (_download_portable_full 과 달리
+        추출 대상 경로를 넘길 수 있음)."""
+        dest_dir = get_download_dir()
+        file_name = info.zip_name or f"chorok_multi_{info.version}.zip"
+        dest_path = os.path.join(dest_dir, file_name)
+
+        total_mb = info.zip_size / (1024 * 1024) if info.zip_size else 0
+        initial_msg = (
+            f"{file_name} 다운로드 준비 중..."
+            if total_mb == 0
+            else f"{file_name}\n약 {total_mb:.1f} MB 다운로드 준비 중..."
+        )
+        progress_dlg = wx.ProgressDialog(
+            "업데이트 다운로드",
+            initial_msg,
+            maximum=1000, parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT
+                  | wx.PD_ELAPSED_TIME | wx.PD_REMAINING_TIME
+                  | wx.PD_AUTO_HIDE,
+        )
+        state = {"cancelled": False, "error": None, "path": None}
+
+        def progress_cb(downloaded, total):
+            def ui():
+                if state["cancelled"]:
+                    return
+                if total > 0:
+                    value = min(999, int(downloaded / total * 1000))
+                    msg = (
+                        f"{file_name}\n"
+                        f"{downloaded / (1024*1024):.1f} MB / "
+                        f"{total / (1024*1024):.1f} MB"
+                    )
+                else:
+                    value = 0
+                    msg = f"{file_name}\n{downloaded / (1024*1024):.1f} MB 다운로드 중..."
+                keep_going, _ = progress_dlg.Update(value, msg)
+                if not keep_going:
+                    state["cancelled"] = True
+            wx.CallAfter(ui)
+            return not state["cancelled"]
+
+        def worker():
+            try:
+                path = download_installer(info.zip_url, dest_path, progress_cb=progress_cb)
+                state["path"] = path
+            except DownloadCancelled:
+                state["cancelled"] = True
+            except Exception as e:
+                state["error"] = str(e)
+            finally:
+                wx.CallAfter(on_finished)
+
+        def on_finished():
+            try:
+                progress_dlg.Destroy()
+            except Exception:
+                pass
+            if state["cancelled"]:
+                speak("업데이트를 취소했습니다.")
+                return
+            if state["error"]:
+                speak("업데이트 다운로드에 실패했습니다.")
+                wx.MessageBox(
+                    f"ZIP 파일을 내려받지 못했습니다.\n{state['error']}",
+                    "다운로드 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                return
+            self._apply_portable_update(info, state["path"],
+                                        delta_paths=delta_paths, manifest=manifest)
+
+        speak("변경된 파일을 내려받는 중입니다." if delta_paths else "업데이트를 내려받는 중입니다.")
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finalize_portable_update(self, info: ReleaseInfo, staging_dir: str, manifest=None):
+        """재시작 스크립트 실행 후 초록멀티 종료."""
+        # manifest 가 있으면 새 exe 이름을 거기서, 없으면 기존 이름 유지
+        if manifest and manifest.get("executable"):
+            new_exe_name = str(manifest.get("executable"))
+        else:
+            new_exe_name = os.path.basename(sys.executable) if getattr(sys, "frozen", False) else "초록멀티 v1.4.exe"
+        old_exe_path = sys.executable if getattr(sys, "frozen", False) else os.path.join(get_install_dir(), new_exe_name)
+
+        ans = wx.MessageBox(
+            "다운로드가 완료되었습니다.\n"
+            "초록멀티를 종료하고 파일 교체 후 새 버전을 실행합니다.\n"
+            "계속하시겠습니까?",
+            "포터블 업데이트 적용",
+            wx.YES_NO | wx.ICON_INFORMATION, self,
+        )
+        if ans != wx.YES:
+            speak("업데이트 적용을 취소했습니다. 스테이징 폴더에 새 파일이 남아 있습니다.")
+            return
+
+        try:
+            script = write_restart_script(
+                staging_dir=staging_dir,
+                install_dir=get_install_dir(),
+                new_exe_name=new_exe_name,
+                old_exe_path=old_exe_path,
+            )
+            import subprocess
+            subprocess.Popen(
+                ["cmd", "/c", script],
+                creationflags=0x00000008,  # DETACHED_PROCESS
+                close_fds=True,
+            )
+        except Exception as e:
+            wx.MessageBox(
+                f"업데이트 스크립트를 실행하지 못했습니다.\n{e}\n\n"
+                f"스테이징 폴더:\n{staging_dir}",
+                "업데이트 실행 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        speak("업데이트를 적용하고 초록멀티를 재시작합니다.")
+        wx.CallLater(800, self.Close)
+
     # ── 사용자 설명서 (Shift+F1) ──
 
     def on_show_manual(self, event):
@@ -2427,6 +3096,7 @@ class MainFrame(wx.Frame):
             "Alt+E: 관리자에게 메일 보내기",
             "F1: 프로그램 정보",
             "Shift+F1: 사용자 설명서",
+            "Alt+U: 업데이트 확인",
             "Alt+F4: 프로그램 종료",
             "",
             "=== 화면 설정 (저시력 지원) ===",
@@ -2462,6 +3132,86 @@ class MainFrame(wx.Frame):
 
     def on_exit(self, event):
         self.Close()
+
+
+# ─────────────────────────────────────────────────────────────
+# 업데이트 안내 대화상자
+# ─────────────────────────────────────────────────────────────
+
+class UpdateDialog(wx.Dialog):
+    """새 버전 발견 시 안내 대화상자.
+
+    버튼 결과:
+        RESULT_UPDATE_NOW   — 지금 업데이트
+        RESULT_LATER        — 나중에 (아무것도 저장 안 함)
+        RESULT_SKIP_VERSION — 이 버전 건너뛰기 (skip_version 저장)
+    """
+    RESULT_UPDATE_NOW = 1001
+    RESULT_LATER = 1002
+    RESULT_SKIP_VERSION = 1003
+
+    def __init__(self, parent, info, current_version: str, font_size: int):
+        super().__init__(
+            parent,
+            title="초록멀티 업데이트 알림",
+            size=(560, 460),
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        self._info = info
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        heading = wx.StaticText(
+            panel,
+            label=f"새 버전 {info.version}이(가) 공개되었습니다.",
+        )
+        heading.SetFont(make_font(font_size + 2).Bold())
+
+        sub = wx.StaticText(
+            panel,
+            label=f"현재 버전: {current_version}     최신 버전: {info.version}",
+        )
+
+        notes_label = wx.StaticText(panel, label="변경 사항(&N):")
+        notes = wx.TextCtrl(
+            panel,
+            value=info.body or "(변경 사항이 비어 있습니다)",
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP,
+            name="변경 사항",
+        )
+        notes.SetFont(make_font(font_size))
+
+        # 버튼
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        update_btn = wx.Button(panel, label="지금 업데이트(&U)")
+        later_btn = wx.Button(panel, label="나중에(&L)")
+        skip_btn = wx.Button(panel, label="이 버전 건너뛰기(&S)")
+        btn_sizer.Add(update_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(later_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(skip_btn, 0, wx.ALL, 5)
+
+        sizer.Add(heading, 0, wx.ALL, 10)
+        sizer.Add(sub, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        sizer.Add(notes_label, 0, wx.LEFT | wx.TOP, 10)
+        sizer.Add(notes, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        panel.SetSizer(sizer)
+
+        update_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(self.RESULT_UPDATE_NOW))
+        later_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(self.RESULT_LATER))
+        skip_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(self.RESULT_SKIP_VERSION))
+
+        update_btn.SetDefault()
+        update_btn.SetFocus()
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        self.Centre()
+
+    def _on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.EndModal(self.RESULT_LATER)
+            return
+        event.Skip()
 
 
 # ─────────────────────────────────────────────────────────────

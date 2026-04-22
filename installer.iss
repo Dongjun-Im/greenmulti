@@ -1,12 +1,12 @@
-; 초록멀티 v1.3 — Inno Setup 설치 스크립트
+; 초록멀티 v1.4 — Inno Setup 설치 스크립트
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.3.0"
-#define AppVersionDisplay "v1.3"
+#define AppVersion "1.4.0"
+#define AppVersionDisplay "v1.4"
 #define AppPublisher "초록등대 동호회"
-#define AppExeName "초록멀티 v1.3.exe"
-#define AppDistName "초록멀티 v1.3"
+#define AppExeName "초록멀티 v1.4.exe"
+#define AppDistName "초록멀티 v1.4"
 
 [Setup]
 AppId={{B3F9A4D2-5E7C-4F8B-A1D6-3E2C7B8F9A01}
@@ -19,10 +19,14 @@ DefaultDirName={autopf}\{#AppName} {#AppVersionDisplay}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=installer_out
-OutputBaseFilename=초록멀티_v1.3_setup
+OutputBaseFilename=초록멀티_v1.4_setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+; 자동 업데이트: 실행 중인 초록멀티를 설치 프로그램이 종료시키고 (기본 yes)
+; 설치 후 다시 실행하도록 Restart Manager 사용을 명시적으로 활성화.
+CloseApplications=yes
+RestartApplications=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
