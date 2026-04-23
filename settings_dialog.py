@@ -264,8 +264,148 @@ class SoundPage(wx.Panel):
 CATEGORIES: list[tuple[str, str]] = [
     ("theme", "화면 테마"),
     ("sound", "사운드"),
+    ("notify", "알림"),
     ("update", "업데이트"),
 ]
+
+
+# 알림 주기 옵션
+NOTIFY_INTERVAL_OPTIONS: list[tuple[int, str]] = [
+    (0, "끄기"),
+    (30, "30초"),
+    (60, "1분"),
+    (180, "3분"),
+    (300, "5분"),
+]
+
+
+LIST_PAGE_SIZE_OPTIONS: list[int] = [10, 20, 30, 50, 100]
+
+
+def load_notify_settings() -> dict:
+    """알림 + 목록 설정 로드."""
+    import json
+    from config import MEMO_NOTIFY_SETTINGS_FILE
+    defaults = {
+        "interval_sec": 60,
+        "check_memo": True,
+        "check_mail": True,
+        "list_page_size": 10,
+    }
+    if not os.path.exists(MEMO_NOTIFY_SETTINGS_FILE):
+        return defaults
+    try:
+        with open(MEMO_NOTIFY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            defaults["interval_sec"] = int(data.get("interval_sec", 60))
+            defaults["check_memo"] = bool(data.get("check_memo", True))
+            defaults["check_mail"] = bool(data.get("check_mail", True))
+            size = int(data.get("list_page_size", 10))
+            if size not in LIST_PAGE_SIZE_OPTIONS:
+                # 가장 가까운 값으로
+                size = min(LIST_PAGE_SIZE_OPTIONS, key=lambda x: abs(x - size))
+            defaults["list_page_size"] = size
+    except Exception:
+        pass
+    return defaults
+
+
+def save_notify_settings(settings: dict) -> None:
+    import json
+    from config import MEMO_NOTIFY_SETTINGS_FILE, DATA_DIR
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        cleaned = {
+            "interval_sec": int(settings.get("interval_sec", 60)),
+            "check_memo": bool(settings.get("check_memo", True)),
+            "check_mail": bool(settings.get("check_mail", True)),
+            "list_page_size": int(settings.get("list_page_size", 10)),
+        }
+        with open(MEMO_NOTIFY_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+class NotifyPage(wx.Panel):
+    """알림 설정 페이지."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.settings = load_notify_settings()
+
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        info = wx.StaticText(
+            self,
+            label="쪽지·메일 실시간 알림 설정입니다.\n"
+                  "알림 센터(Ctrl+Shift+N)에 새 알림이 들어옵니다.",
+        )
+        vbox.Add(info, 0, wx.ALL, 8)
+
+        # 알림 주기 RadioBox
+        self._interval_values = [sec for sec, _ in NOTIFY_INTERVAL_OPTIONS]
+        labels = [lbl for _, lbl in NOTIFY_INTERVAL_OPTIONS]
+        self.interval_rb = wx.RadioBox(
+            self, label="알림 확인 주기(&I)",
+            choices=labels,
+            majorDimension=1, style=wx.RA_SPECIFY_COLS,
+        )
+        cur = int(self.settings.get("interval_sec", 60))
+        try:
+            cur_idx = self._interval_values.index(cur)
+        except ValueError:
+            cur_idx = self._interval_values.index(60)
+        self.interval_rb.SetSelection(cur_idx)
+        vbox.Add(self.interval_rb, 0, wx.ALL, 8)
+
+        # 확인 대상 체크박스
+        self.cb_memo = wx.CheckBox(self, label="쪽지 알림 받기(&M)")
+        self.cb_memo.SetValue(bool(self.settings.get("check_memo", True)))
+        vbox.Add(self.cb_memo, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.cb_mail = wx.CheckBox(self, label="메일 알림 받기(&A)")
+        self.cb_mail.SetValue(bool(self.settings.get("check_mail", True)))
+        vbox.Add(self.cb_mail, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # 목록 항목 수 RadioBox (쪽지·메일 목록에서 한 번에 표시할 개수)
+        self._list_size_values = list(LIST_PAGE_SIZE_OPTIONS)
+        size_labels = [f"{n}개" for n in LIST_PAGE_SIZE_OPTIONS]
+        self.list_size_rb = wx.RadioBox(
+            self, label="쪽지·메일 목록에 표시할 개수(&L)",
+            choices=size_labels,
+            majorDimension=1, style=wx.RA_SPECIFY_COLS,
+        )
+        cur_size = int(self.settings.get("list_page_size", 10))
+        try:
+            cur_idx = self._list_size_values.index(cur_size)
+        except ValueError:
+            cur_idx = 0
+        self.list_size_rb.SetSelection(cur_idx)
+        vbox.Add(self.list_size_rb, 0, wx.ALL, 8)
+
+        note = wx.StaticText(
+            self,
+            label="변경 사항은 설정 창을 닫을 때 저장되고 즉시 적용됩니다.",
+        )
+        vbox.Add(note, 0, wx.ALL, 8)
+
+        self.SetSizer(vbox)
+
+    def save(self):
+        idx = self.interval_rb.GetSelection()
+        interval_sec = self._interval_values[idx]
+        size_idx = self.list_size_rb.GetSelection()
+        list_page_size = self._list_size_values[size_idx]
+        new_settings = {
+            "interval_sec": interval_sec,
+            "check_memo": self.cb_memo.GetValue(),
+            "check_mail": self.cb_mail.GetValue(),
+            "list_page_size": list_page_size,
+        }
+        save_notify_settings(new_settings)
+        self.settings = new_settings
+        return new_settings
 
 
 class UpdatePage(wx.Panel):
@@ -418,9 +558,11 @@ class SettingsDialog(wx.Dialog):
         self.book = wx.Simplebook(self)
         self.theme_page = ThemePage(self.book)
         self.sound_page = SoundPage(self.book)
+        self.notify_page = NotifyPage(self.book)
         self.update_page = UpdatePage(self.book)
         self.book.AddPage(self.theme_page, "화면 테마")
         self.book.AddPage(self.sound_page, "사운드")
+        self.book.AddPage(self.notify_page, "알림")
         self.book.AddPage(self.update_page, "업데이트")
         self.book.SetSelection(0)
 
@@ -478,11 +620,15 @@ class SettingsDialog(wx.Dialog):
         self.category_list.SetFocus()
 
     def _on_ok(self, event):
-        # 테마는 ThemePage 선택 즉시 저장+적용됨. 여기선 사운드·업데이트만 저장.
+        # 테마는 ThemePage 선택 즉시 저장+적용됨. 사운드·알림·업데이트 저장.
         try:
             save_sound_settings(self.sound_page.collect())
         except Exception as e:
             speak(f"사운드 설정 저장 실패. {e}")
+        try:
+            self.notify_page.save()
+        except Exception as e:
+            speak(f"알림 설정 저장 실패. {e}")
         try:
             save_update_settings(self.update_page.collect())
         except Exception as e:

@@ -1,5 +1,6 @@
 """초록멀티 - 메인 진입점"""
 import os
+import sys
 
 import wx
 
@@ -13,6 +14,7 @@ class ChorokMultiApp(wx.App):
     def OnInit(self):
         self.session = None
         self._play_startup_sound()
+        self._cleanup_old_update_artifacts()
 
         # 인증 절차 실행
         self.session = run_authentication()
@@ -103,6 +105,23 @@ class ChorokMultiApp(wx.App):
                 from green_auth import speak
                 speak("메뉴 감지에 실패했습니다. 기존 메뉴를 사용합니다.")
             except Exception:
+                pass
+
+    def _cleanup_old_update_artifacts(self):
+        """직전 업데이트에서 남은 *.exe.old 파일들을 정리.
+
+        PS 재시작 스크립트가 정리에 실패했더라도 다음 실행 시 여기서
+        확실하게 지운다. 현재 실행 중인 새 exe 와 이름이 다르므로 잠금 없음.
+        """
+        if not getattr(sys, "frozen", False):
+            return
+        import glob
+        exe_dir = os.path.dirname(sys.executable)
+        for path in glob.glob(os.path.join(exe_dir, "*.exe.old")):
+            try:
+                os.remove(path)
+            except OSError:
+                # 아직 핸들이 잡혀 있으면 다음 실행 때 재시도
                 pass
 
     def _play_startup_sound(self):

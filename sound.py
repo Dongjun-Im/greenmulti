@@ -24,6 +24,7 @@ SOUND_EVENTS: list[tuple[str, str]] = [
     ("home_end", "홈/엔드 키 경고음"),
     ("download_start", "파일 다운로드 시작"),
     ("download_complete", "파일 다운로드 완료"),
+    ("memo_new", "새 쪽지 도착"),
 ]
 
 EVENT_KEYS = [k for k, _ in SOUND_EVENTS]

@@ -40,6 +40,32 @@ LOGIN_URL = f"{SORISEM_BASE_URL}/bbs/login_check.php"
 LOGOUT_URL = f"{SORISEM_BASE_URL}/bbs/logout.php"
 GREEN_CLUB_MEMBERS_URL = f"{SORISEM_BASE_URL}/plugin/ar.club/admin.member.php?cl=green"
 
+# 쪽지 (소리샘 전용 ar.memo 플러그인)
+MEMO_PLUGIN_BASE = f"{SORISEM_BASE_URL}/plugin/ar.memo"
+MEMO_LIST_URL = f"{MEMO_PLUGIN_BASE}/memo.php"
+MEMO_VIEW_URL = f"{MEMO_PLUGIN_BASE}/memo_view.php"
+MEMO_FORM_URL = f"{MEMO_PLUGIN_BASE}/memo_form.php"
+MEMO_FORM_UPDATE_URL = f"{MEMO_PLUGIN_BASE}/memo_form_update.php"
+MEMO_DELETE_URL = f"{MEMO_PLUGIN_BASE}/memo_delete.php"
+MEMO_LIST_UPDATE_URL = f"{MEMO_PLUGIN_BASE}/memo_list_update.php"
+MEMO_CHECK_NEW_URL = f"{MEMO_PLUGIN_BASE}/memo_check_new.php"
+
+# 쪽지 실시간 알림 설정
+MEMO_NOTIFY_SETTINGS_FILE = os.path.join(DATA_DIR, "memo_notify_settings.json")
+MEMO_NOTIFY_INTERVAL_SEC = 60  # 1분마다 폴링
+
+# 메일(gnuboard5 formmail plugin) — 외부 이메일 발송
+MAIL_FORM_URL = f"{SORISEM_BASE_URL}/bbs/formmail.php"
+MAIL_SEND_URL = f"{SORISEM_BASE_URL}/bbs/formmail_send.php"
+
+# 메일 수신함 (사이트 내 /message/ 플러그인) — gnuboard5 내부 메시지 시스템
+MAIL_INBOX_BASE = f"{SORISEM_BASE_URL}/message"
+MAIL_INBOX_URL = f"{MAIL_INBOX_BASE}/inbox.php"
+MAIL_SENT_URL = f"{MAIL_INBOX_BASE}/sent.php"
+MAIL_INBOX_VIEW_URL = f"{MAIL_INBOX_BASE}/inbox_view.php"
+MAIL_SENT_VIEW_URL = f"{MAIL_INBOX_BASE}/sent_view.php"
+MAIL_WRITE_URL = f"{MAIL_INBOX_BASE}/write.php"
+
 # 다운로드 폴더 설정 파일
 DOWNLOAD_DIR_FILE = os.path.join(DATA_DIR, "download_dir.txt")
 

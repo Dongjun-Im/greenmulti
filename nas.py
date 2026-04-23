@@ -513,6 +513,8 @@ class NasCredentialsDialog(wx.Dialog):
         )
 
         ok_btn = wx.Button(panel, wx.ID_OK, "연결(&O)")
+        signup_btn = wx.Button(panel, label="회원가입(&S)")
+        signup_btn.Bind(wx.EVT_BUTTON, self._on_signup)
         cancel_btn = wx.Button(panel, wx.ID_CANCEL, "취소(&X)")
         ok_btn.SetDefault()
 
@@ -526,6 +528,7 @@ class NasCredentialsDialog(wx.Dialog):
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         btn_row.AddStretchSpacer()
         btn_row.Add(ok_btn, 0, wx.RIGHT, 5)
+        btn_row.Add(signup_btn, 0, wx.RIGHT, 5)
         btn_row.Add(cancel_btn, 0)
 
         outer = wx.BoxSizer(wx.VERTICAL)
@@ -539,6 +542,22 @@ class NasCredentialsDialog(wx.Dialog):
 
     def get_credentials(self) -> tuple[str, str]:
         return self.user_ctrl.GetValue().strip(), self.pw_ctrl.GetValue()
+
+    def _on_signup(self, event):
+        """회원가입 버튼 — 초록등대 자료실 가입 구글 폼을 기본 브라우저로 열기."""
+        import webbrowser
+        signup_url = (
+            "https://docs.google.com/forms/d/e/"
+            "1FAIpQLSfzQJR7bSreaBEuIT8lFhFbFXCXWnljUUi9pZ9L5UujOVwwng/viewform"
+        )
+        try:
+            webbrowser.open(signup_url)
+        except Exception as e:
+            wx.MessageBox(
+                f"회원가입 페이지를 여는 중 오류가 발생했습니다.\n{e}\n\n"
+                f"주소: {signup_url}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
 
 
 def prompt_and_mount(parent, speak_func=None) -> tuple[bool, str]:

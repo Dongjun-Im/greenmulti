@@ -98,18 +98,30 @@ def _parse_release_json(data: dict) -> Optional[ReleaseInfo]:
     return info
 
 
+_LAST_CHECK_ERROR: str = ""
+
+
+def get_last_check_error() -> str:
+    """가장 최근 check_latest_release 실패 원인 한 줄 요약."""
+    return _LAST_CHECK_ERROR
+
+
 def check_latest_release(
-    timeout: float = 5.0, channel: str = "stable",
+    timeout: float = 10.0, channel: str = "stable",
 ) -> Optional[ReleaseInfo]:
     """GitHub Releases 최신 릴리스 조회.
 
     channel="beta" 이면 pre-release 를 포함한 모든 릴리스 중 최신 버전을 반환.
-    네트워크 실패/비정상 응답은 모두 None (조용히 실패).
+    네트워크 실패/비정상 응답은 모두 None (조용히 실패). 실패 원인은
+    get_last_check_error() 로 조회 가능.
     """
+    global _LAST_CHECK_ERROR
+    _LAST_CHECK_ERROR = ""
+    url = UPDATE_LIST_API_URL if channel == "beta" else UPDATE_API_URL
     try:
         if channel == "beta":
             resp = requests.get(
-                UPDATE_LIST_API_URL,
+                url,
                 headers={
                     "Accept": "application/vnd.github+json",
                     "User-Agent": "greenmulti-updater",
@@ -118,13 +130,20 @@ def check_latest_release(
                 timeout=timeout,
             )
             if resp.status_code != 200:
+                _LAST_CHECK_ERROR = (
+                    f"HTTP {resp.status_code} ({url})"
+                    + (" - 저장소가 비공개이거나 이름이 바뀌었을 수 있습니다."
+                       if resp.status_code == 404 else "")
+                )
                 return None
             releases = resp.json()
             if not isinstance(releases, list) or not releases:
+                _LAST_CHECK_ERROR = "릴리스 목록이 비어 있습니다."
                 return None
             # draft 제외. 버전 기준 내림차순 정렬.
             candidates = [r for r in releases if not r.get("draft")]
             if not candidates:
+                _LAST_CHECK_ERROR = "공개된 릴리스(draft 제외)가 없습니다."
                 return None
             candidates.sort(
                 key=lambda r: _parse_version(str(r.get("tag_name", ""))),
@@ -133,7 +152,7 @@ def check_latest_release(
             data = candidates[0]
         else:
             resp = requests.get(
-                UPDATE_API_URL,
+                url,
                 headers={
                     "Accept": "application/vnd.github+json",
                     "User-Agent": "greenmulti-updater",
@@ -141,9 +160,24 @@ def check_latest_release(
                 timeout=timeout,
             )
             if resp.status_code != 200:
+                _LAST_CHECK_ERROR = (
+                    f"HTTP {resp.status_code} ({url})"
+                    + (" - 저장소가 비공개이거나 이름이 바뀌었을 수 있습니다."
+                       if resp.status_code == 404 else "")
+                )
                 return None
             data = resp.json()
-    except (requests.RequestException, ValueError):
+    except requests.Timeout:
+        _LAST_CHECK_ERROR = f"응답 시간 초과 ({int(timeout)}초): {url}"
+        return None
+    except requests.ConnectionError as e:
+        _LAST_CHECK_ERROR = f"연결 실패: {e.__class__.__name__}"
+        return None
+    except requests.RequestException as e:
+        _LAST_CHECK_ERROR = f"요청 오류: {e.__class__.__name__}: {e}"
+        return None
+    except ValueError as e:
+        _LAST_CHECK_ERROR = f"응답 JSON 파싱 실패: {e}"
         return None
 
     info = _parse_release_json(data)
@@ -530,44 +564,167 @@ def write_restart_script(
     install_dir: str,
     new_exe_name: str,
     old_exe_path: str,
+    backup_exe_path: Optional[str] = None,
 ) -> str:
-    """구 exe 를 종료시키고 staging_dir 의 내용을 install_dir 에 복사한 뒤
-    새 exe 를 실행하는 배치 스크립트를 임시로 생성해 경로 반환.
+    """구 exe 종료 → staging_dir 내용을 install_dir 에 복사 → 새 exe 실행 하는
+    PowerShell 스크립트를 임시로 생성해 경로 반환.
 
-    배치는 실행 후 자동 삭제되도록 자기 자신을 지운다.
+    두 가지 모드:
+    - backup_exe_path 가 주어짐 (rename-then-cleanup 모드): 호출자가 이미
+      실행 중 exe 를 .old 로 rename 해 둔 상태. PS 는 짧게 대기 → robocopy →
+      새 exe 실행 → .old 정리 루프. 경쟁 조건 없음.
+    - backup_exe_path 가 None (폴백 모드): rename 이 실패했거나 같은 이름
+      업데이트. PS 는 긴 대기 + 구 exe 삭제 재시도 루프 → robocopy → 새 exe.
     """
     script_dir = tempfile.mkdtemp(prefix="chorok_multi_update_")
-    script_path = os.path.join(script_dir, "apply_update.bat")
+    script_path = os.path.join(script_dir, "apply_update.ps1")
+    log_path = os.path.join(script_dir, "apply_update.log")
     new_exe_path = os.path.join(install_dir, new_exe_name)
 
-    # 구 exe 이름이 바뀐 경우(예: "초록멀티 v1.4.exe" → "초록멀티 v1.5.exe")
-    # 구 exe 를 삭제해서 폴더에 두 개가 공존하지 않게 한다.
-    remove_old_line = ""
-    if os.path.normcase(os.path.abspath(old_exe_path)) != os.path.normcase(
+    same_name = os.path.normcase(os.path.abspath(old_exe_path)) == os.path.normcase(
         os.path.abspath(new_exe_path)
-    ):
-        remove_old_line = f'del /f /q "{old_exe_path}" >nul 2>&1\r\n'
+    )
 
-    # robocopy 로 staging_dir → install_dir 로 복사. /E 로 하위 폴더 포함.
-    # /NFL /NDL /NJH /NJS /NC /NS /NP 로 출력 조용히.
-    # robocopy 종료 코드 8 이상이 에러라서 /xo 로만으로도 대부분 정상 종료.
-    lines = [
-        "@echo off",
-        "chcp 65001 >nul",
-        # 구 exe 핸들이 풀릴 때까지 잠시 대기
-        "ping -n 3 127.0.0.1 >nul",
-        remove_old_line.rstrip("\r\n"),
-        f'robocopy "{staging_dir}" "{install_dir}" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul',
-        # robocopy 종료 코드가 0-7 은 정상
-        "if errorlevel 8 (",
-        '    echo 파일 복사 중 오류가 발생했습니다. 스테이징 폴더: "%~dp0"',
-        "    pause",
-        "    exit /b 1",
-        ")",
-        f'start "" "{new_exe_path}"',
-        # 자기 자신 삭제
-        'rmdir /s /q "%~dp0" >nul 2>&1',
-    ]
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write("\r\n".join(l for l in lines if l is not None) + "\r\n")
+    def ps_quote(s: str) -> str:
+        # 작은따옴표 문자열 안에서 ' 를 '' 로 이스케이프 (PowerShell 리터럴 규칙)
+        return "'" + s.replace("'", "''") + "'"
+
+    ps_new = ps_quote(new_exe_path)
+    ps_staging = ps_quote(staging_dir)
+    ps_install = ps_quote(install_dir)
+    ps_log = ps_quote(log_path)
+    ps_script_dir = ps_quote(script_dir)
+
+    if backup_exe_path is not None:
+        # rename-then-cleanup 모드
+        ps_backup = ps_quote(backup_exe_path)
+        mode_block = f"""
+"[{{0}}] mode: rename-then-cleanup" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+"[{{0}}] backup path: {backup_exe_path}" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+# 부모 프로세스 완전 종료 대기 (rename 이 선행됐으므로 짧게)
+Start-Sleep -Seconds 2
+""".strip("\n")
+        cleanup_block = f"""
+# .old 정리 — 설치 폴더 전체의 *.exe.old 대상. 실패해도 치명적 아님.
+Get-ChildItem -LiteralPath $install -Filter '*.exe.old' -ErrorAction SilentlyContinue | ForEach-Object {{
+    $target = $_.FullName
+    for ($i = 0; $i -lt 10; $i++) {{
+        try {{
+            Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+            "[{{0}}] removed .old: $target" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+            break
+        }} catch {{
+            Start-Sleep -Seconds 1
+        }}
+    }}
+    if (Test-Path -LiteralPath $target) {{
+        "[{{0}}] WARNING: .old still present: $target" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    }}
+}}
+""".strip("\n")
+    else:
+        # 폴백 모드 — 기존 동작
+        ps_old = ps_quote(old_exe_path)
+        remove_block = ""
+        if not same_name:
+            remove_block = f"""
+# 구 exe 삭제 — 잠금 해제까지 최대 15회 × 1초 재시도
+$oldExe = {ps_old}
+for ($i = 0; $i -lt 15; $i++) {{
+    if (-not (Test-Path -LiteralPath $oldExe)) {{ break }}
+    try {{
+        Remove-Item -LiteralPath $oldExe -Force -ErrorAction Stop
+        "[{{0}}] removed old exe: $oldExe" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+        break
+    }} catch {{
+        Start-Sleep -Seconds 1
+    }}
+}}
+if (Test-Path -LiteralPath $oldExe) {{
+    "[{{0}}] WARNING: old exe still exists after retries: $oldExe" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+}}
+""".strip("\n")
+        mode_block = f"""
+"[{{0}}] mode: delete-retry (fallback)" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+# 구 exe 핸들이 풀릴 때까지 잠시 대기
+Start-Sleep -Seconds 3
+
+{remove_block}
+""".strip("\n")
+        cleanup_block = ""
+
+    content = f"""$ErrorActionPreference = 'Continue'
+$logPath = {ps_log}
+"[{{0}}] apply_update start (PID={{1}})" -f (Get-Date -Format o), $PID | Set-Content -LiteralPath $logPath -Encoding UTF8
+
+{mode_block}
+
+$staging = {ps_staging}
+$install = {ps_install}
+$newExe = {ps_new}
+
+# staging 내용 로깅 — 압축 해제 결과 검증
+"[{{0}}] staging listing:" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+try {{
+    Get-ChildItem -LiteralPath $staging -Recurse -ErrorAction Stop | ForEach-Object {{
+        "  {{0}}  ({{1}} bytes)" -f $_.FullName, $_.Length | Add-Content -LiteralPath $logPath
+    }}
+}} catch {{
+    "[{{0}}] ERROR listing staging: $_" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+}}
+
+# staging_dir 의 내용을 install_dir 로 복사 (robocopy /E = 하위 폴더 포함)
+# Start-Process 대신 call operator 사용 — CREATE_NO_WINDOW 환경에서 더 안정적.
+"[{{0}}] robocopy invoke: $staging -> $install" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+$roboOut = & robocopy $staging $install /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP 2>&1
+$roboExit = $LASTEXITCODE
+"[{{0}}] robocopy exit=$roboExit" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+if ($roboOut) {{
+    "[{{0}}] robocopy output:" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    $roboOut | Out-String | Add-Content -LiteralPath $logPath
+}}
+# robocopy 종료 코드: 0-7 정상, 8+ 실패. 단 2+ 은 "추가 파일 있음" 등 정상 상태 포함.
+if ($roboExit -ge 8) {{
+    "[{{0}}] ERROR: robocopy failed with exit=$roboExit. Staging left for inspection." -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    exit 1
+}}
+
+# install_dir 에 새 exe 가 실제로 생성됐는지 확인
+if (Test-Path -LiteralPath $newExe) {{
+    $newInfo = Get-Item -LiteralPath $newExe
+    "[{{0}}] new exe present: $newExe ($($newInfo.Length) bytes)" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+}} else {{
+    "[{{0}}] ERROR: new exe missing after robocopy: $newExe" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    "[{{0}}] install_dir listing:" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    try {{
+        Get-ChildItem -LiteralPath $install -ErrorAction Stop | ForEach-Object {{
+            "  {{0}}" -f $_.FullName | Add-Content -LiteralPath $logPath
+        }}
+    }} catch {{
+        "[{{0}}] ERROR listing install: $_" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+    }}
+    exit 2
+}}
+
+# 새 exe 실행 — -WorkingDirectory 명시 (PyInstaller onedir 는 cwd 기준 리소스 탐색)
+"[{{0}}] launching new exe: $newExe" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+try {{
+    Start-Process -FilePath $newExe -WorkingDirectory $install -ErrorAction Stop
+    "[{{0}}] launched successfully" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+}} catch {{
+    "[{{0}}] ERROR launching new exe: $_" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+}}
+
+{cleanup_block}
+
+"[{{0}}] apply_update done" -f (Get-Date -Format o) | Add-Content -LiteralPath $logPath
+
+# 자기 자신(임시 스크립트 폴더) 삭제
+Start-Sleep -Seconds 1
+Remove-Item -LiteralPath {ps_script_dir} -Recurse -Force -ErrorAction SilentlyContinue
+"""
+
+    # PowerShell 스크립트는 UTF-8 with BOM 으로 저장해야 한글 안전
+    with open(script_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write(content)
     return script_path

@@ -292,6 +292,12 @@ class MainFrame(wx.Frame):
         # 먼저 끝나도록 몇 초 지연 후 백그라운드로 실행.
         wx.CallLater(3000, self._auto_update_check)
 
+        # 쪽지 실시간 알림 폴링 시작 (1분 간격)
+        self._unread_memo_count = 0
+        self._unread_mail_count = 0
+        self._base_title = APP_NAME
+        wx.CallLater(5000, self._start_memo_notifier)
+
     def _try_auto_mount_nas(self):
         """저장된 NAS 자격증명이 있으면 백그라운드로 rclone 마운트 시도."""
         try:
@@ -418,7 +424,16 @@ class MainFrame(wx.Frame):
         # 도구 메뉴
         tools_menu = wx.Menu()
         self.id_nas_connect = wx.NewIdRef()
+        self.id_memo_inbox = wx.NewIdRef()
+        self.id_memo_compose = wx.NewIdRef()
+        self.id_mail_compose = wx.NewIdRef()
         tools_menu.Append(self.id_nas_connect, "초록등대 자료실 연결(&N)\tCtrl+N")
+        tools_menu.AppendSeparator()
+        tools_menu.Append(self.id_memo_inbox, "쪽지함 열기(&M)\tCtrl+M")
+        tools_menu.Append(self.id_memo_compose, "쪽지 쓰기\tCtrl+Shift+M")
+        tools_menu.Append(self.id_mail_compose, "메일함 열기\tCtrl+Shift+E")
+        self.id_memo_check_now = wx.NewIdRef()
+        tools_menu.Append(self.id_memo_check_now, "알림 센터 열기\tCtrl+Shift+N")
         menubar.Append(tools_menu, "도구(&T)")
 
         # 도움말 메뉴
@@ -461,6 +476,10 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_show_settings, id=self.id_settings)
         self.Bind(wx.EVT_MENU, self.on_board_refresh, id=self.id_board_refresh)
         self.Bind(wx.EVT_MENU, self._on_menu_nas_connect, id=self.id_nas_connect)
+        self.Bind(wx.EVT_MENU, self.on_open_memo_inbox, id=self.id_memo_inbox)
+        self.Bind(wx.EVT_MENU, self.on_open_memo_compose, id=self.id_memo_compose)
+        self.Bind(wx.EVT_MENU, self.on_open_mail_compose, id=self.id_mail_compose)
+        self.Bind(wx.EVT_MENU, self.on_memo_check_now, id=self.id_memo_check_now)
 
     def _build_status_bar(self):
         self.status_bar = self.CreateStatusBar(2)
@@ -502,6 +521,10 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("K"), self.id_shortcuts),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("L"), self.id_logout),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("N"), self.id_nas_connect),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("M"), self.id_memo_inbox),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("M"), self.id_memo_compose),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("E"), self.id_mail_compose),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("N"), self.id_memo_check_now),
             wx.AcceleratorEntry(wx.ACCEL_ALT, ord("G"), self.id_goto),
             wx.AcceleratorEntry(wx.ACCEL_NORMAL, wx.WXK_F1, self.id_about),
             wx.AcceleratorEntry(wx.ACCEL_SHIFT, wx.WXK_F1, self.id_manual),
@@ -576,13 +599,19 @@ class MainFrame(wx.Frame):
         speak(f"글꼴 크기를 원래대로 되돌렸습니다. {DEFAULT_FONT_SIZE}")
 
     def on_show_settings(self, event):
-        """F7: 통합 설정 대화상자 (테마 + 사운드)."""
+        """F7: 통합 설정 대화상자 (테마 + 사운드 + 알림 + 업데이트)."""
         try:
             from settings_dialog import SettingsDialog
             dlg = SettingsDialog(self)
-            dlg.ShowModal()
+            result = dlg.ShowModal()
             dlg.Destroy()
             self._apply_full_theme()
+            # 알림 주기 변경 반영
+            if result == wx.ID_OK:
+                try:
+                    self.restart_memo_notifier()
+                except Exception:
+                    pass
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -2405,10 +2434,13 @@ class MainFrame(wx.Frame):
     def _on_update_check_done(self, info, manual: bool):
         if info is None:
             if manual:
+                from updater import get_last_check_error
+                reason = get_last_check_error() or "알 수 없는 오류"
                 speak("업데이트 정보를 확인할 수 없습니다.")
                 wx.MessageBox(
                     "업데이트 서버에 연결할 수 없습니다.\n"
-                    "인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+                    "인터넷 연결을 확인한 뒤 다시 시도해 주세요.\n\n"
+                    f"상세: {reason}",
                     "업데이트 확인 실패",
                     wx.OK | wx.ICON_WARNING, self,
                 )
@@ -2975,17 +3007,54 @@ class MainFrame(wx.Frame):
             speak("업데이트 적용을 취소했습니다. 스테이징 폴더에 새 파일이 남아 있습니다.")
             return
 
+        # staging_dir 검증 — 새 exe 가 실제로 들어있는지 확인
+        expected_new_exe = os.path.join(staging_dir, new_exe_name)
+        if not os.path.exists(expected_new_exe):
+            # 최상위 폴더가 남아있을 수 있음 (extract_zip 의 strip_prefix 가 작동 안 한 경우)
+            alt = None
+            try:
+                for entry in os.listdir(staging_dir):
+                    candidate = os.path.join(staging_dir, entry, new_exe_name)
+                    if os.path.exists(candidate):
+                        alt = os.path.join(staging_dir, entry)
+                        break
+            except OSError:
+                pass
+            if alt is None:
+                wx.MessageBox(
+                    f"업데이트 파일이 손상되었습니다.\n"
+                    f"새 실행 파일이 스테이징 폴더에 없습니다.\n\n"
+                    f"새 exe 이름: {new_exe_name}\n"
+                    f"스테이징 폴더:\n{staging_dir}\n\n"
+                    f"스테이징 폴더를 열어 내용을 확인해 주세요.",
+                    "업데이트 파일 손상", wx.OK | wx.ICON_ERROR, self,
+                )
+                return
+            # 최상위 폴더가 남아있는 경우 robocopy 소스를 그 폴더로 조정
+            staging_dir = alt
+
+        # 실행 중 EXE 를 .old 로 rename 시도. 성공하면 경쟁 조건 없이 교체 가능.
+        backup_exe_path = self._rename_running_exe_to_backup(old_exe_path)
+
         try:
             script = write_restart_script(
                 staging_dir=staging_dir,
                 install_dir=get_install_dir(),
                 new_exe_name=new_exe_name,
                 old_exe_path=old_exe_path,
+                backup_exe_path=backup_exe_path,
             )
             import subprocess
+            # CREATE_NO_WINDOW = 0x08000000 — 콘솔은 숨기되 PS 에게 콘솔 자체는 주어야
+            # 내부의 robocopy/Start-Process 호출이 정상 동작한다. DETACHED_PROCESS(0x8)
+            # 는 PS 에 콘솔이 아예 없어서 -NoNewWindow 자식이 안 돌아간다.
             subprocess.Popen(
-                ["cmd", "/c", script],
-                creationflags=0x00000008,  # DETACHED_PROCESS
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-WindowStyle", "Hidden",
+                    "-File", script,
+                ],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
                 close_fds=True,
             )
         except Exception as e:
@@ -2997,7 +3066,33 @@ class MainFrame(wx.Frame):
             return
 
         speak("업데이트를 적용하고 초록멀티를 재시작합니다.")
-        wx.CallLater(800, self.Close)
+        # rename 이 선행됐으면 구 exe 경쟁이 없으므로 빠르게 Close.
+        # rename 실패 시에도 PS 쪽 Start-Sleep 이 Close 완료를 커버.
+        wx.CallLater(200, self.Close)
+
+    def _rename_running_exe_to_backup(self, old_exe_path: str) -> "str | None":
+        """실행 중인 EXE 를 .old 로 rename. 성공 시 .old 경로, 실패 시 None.
+
+        Windows NTFS 는 in-use 파일의 rename 을 허용하지만, 드물게 백신·
+        스크린리더가 추가 핸들을 잡고 있으면 SHARING_VIOLATION 이 발생.
+        실패 시 None 을 반환해서 호출자가 기존 삭제-재시도 경로로 폴백.
+        """
+        if not getattr(sys, "frozen", False):
+            return None
+        backup_path = old_exe_path + ".old"
+        try:
+            import ctypes
+            from ctypes import wintypes
+            MoveFileExW = ctypes.windll.kernel32.MoveFileExW
+            MoveFileExW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+            MoveFileExW.restype = wintypes.BOOL
+            MOVEFILE_REPLACE_EXISTING = 0x1
+            ok = MoveFileExW(old_exe_path, backup_path, MOVEFILE_REPLACE_EXISTING)
+            if not ok:
+                return None
+            return backup_path
+        except Exception:
+            return None
 
     # ── 사용자 설명서 (Shift+F1) ──
 
@@ -3093,11 +3188,38 @@ class MainFrame(wx.Frame):
             "Ctrl+K: 단축키 안내",
             "Ctrl+L: 로그아웃",
             "Ctrl+N: 초록등대 자료실(NAS) 연결",
+            "Ctrl+M: 쪽지함 열기",
+            "Ctrl+Shift+M: 쪽지 쓰기",
+            "Ctrl+Shift+E: 메일함 열기",
+            "Ctrl+Shift+N: 알림 센터 열기 (새 쪽지·메일)",
             "Alt+E: 관리자에게 메일 보내기",
             "F1: 프로그램 정보",
             "Shift+F1: 사용자 설명서",
             "Alt+U: 업데이트 확인",
             "Alt+F4: 프로그램 종료",
+            "",
+            "=== 쪽지함·메일함 내부 ===",
+            "↑/↓: 항목 이동",
+            "Enter: 쪽지/메일 열기",
+            "D 또는 Delete: 선택 항목 삭제",
+            "Shift+Delete: 현재 함 전체 비우기",
+            "R: 답장 (받은함)",
+            "N: 새 쪽지/메일 작성",
+            "F: 새로고침",
+            "PageDown/PageUp: 다음 페이지 누적 로드",
+            "Alt+R / Alt+S: 받은함 / 보낸함 전환",
+            "Alt+A: 모든 쪽지/메일 삭제",
+            "",
+            "=== 쪽지·메일 보기 창 ===",
+            "PageUp/PageDown, Alt+P/Alt+N: 이전/다음 항목",
+            "R: 답장  D/Delete: 삭제  Esc: 닫기",
+            "(메일) B: 본문 저장  Alt+S: 첨부 선택 저장  Alt+Shift+S: 모든 첨부 저장",
+            "",
+            "=== 알림 센터 (Ctrl+Shift+N) ===",
+            "Enter: 선택 항목 열기",
+            "D 또는 Delete: 선택 알림 지우기",
+            "A: 모든 알림 지우기",
+            "F: 새로고침",
             "",
             "=== 화면 설정 (저시력 지원) ===",
             "F7: 설정 창 열기 (테마·글꼴·사운드 통합)",
@@ -3128,7 +3250,361 @@ class MainFrame(wx.Frame):
         dlg.Destroy()
 
     def on_mail(self, event):
-        webbrowser.open(f"mailto:{APP_ADMIN_EMAIL}")
+        """도움말 > 관리자에게 메일 보내기 (Alt+E) — 소리샘 세션으로 formmail 발송."""
+        try:
+            from mail import MailWriteDialog
+            dlg = MailWriteDialog(self, self.session, mode=MailWriteDialog.MODE_ADMIN)
+            dlg.ShowModal()
+            dlg.Destroy()
+        except Exception as e:
+            speak("메일 대화상자 호출 중 오류가 발생했습니다.")
+            wx.MessageBox(f"메일 대화상자 호출 중 오류가 발생했습니다.\n{e}",
+                          "오류", wx.OK | wx.ICON_ERROR, self)
+
+    def on_open_memo_inbox(self, event):
+        """도구 > 쪽지함 열기 (Ctrl+M)."""
+        try:
+            from memo import MemoInboxDialog
+            dlg = MemoInboxDialog(self, self.session)
+            dlg.ShowModal()
+            dlg.Destroy()
+            # 쪽지함을 직접 열었으니 현재 안 읽은 쪽지는 모두 "본 것" 으로 처리
+            self._unread_memo_count = 0
+            self._update_title_unread()
+            if hasattr(self, "_memo_notifier") and self._memo_notifier:
+                self._memo_notifier.mark_all_as_seen()
+        except Exception as e:
+            speak("쪽지함을 여는 중 오류가 발생했습니다.")
+            wx.MessageBox(f"쪽지함을 여는 중 오류가 발생했습니다.\n{e}",
+                          "오류", wx.OK | wx.ICON_ERROR, self)
+
+    def on_memo_check_now(self, event):
+        """도구 > 알림 센터 열기 (Ctrl+Shift+N).
+
+        열기 전에 쪽지·메일 최신 상태를 한 번 동기식으로 당겨서 센터에 채운 뒤
+        대화상자 표시. 현재 안 읽은 항목은 모두 알림 센터에 들어감.
+        """
+        speak("알림 센터를 엽니다.")
+        self._populate_notification_center_sync()
+        from notification_dialog import NotificationCenterDialog
+        dlg = NotificationCenterDialog(
+            self, self.session,
+            on_open_memo=self._open_memo_from_notification,
+            on_open_mail=self._open_mail_from_notification,
+        )
+        dlg.ShowModal()
+        dlg.Destroy()
+
+    def _populate_notification_center_sync(self):
+        """현재 안 읽은 쪽지·메일을 알림 센터에 즉시 반영 (동기, UI 스레드)."""
+        from notification import NotificationItem, get_center
+        center = get_center()
+        # 쪽지
+        try:
+            from memo import fetch_inbox
+            ok, items = fetch_inbox(self.session, kind="recv")
+            if ok and isinstance(items, list):
+                to_add = []
+                for it in items:
+                    if it.is_read:
+                        continue
+                    to_add.append(NotificationItem(
+                        type="memo",
+                        item_id=it.me_id,
+                        sender=it.counterpart,
+                        summary=it.summary,
+                        timestamp=it.date,
+                        extra=it,
+                    ))
+                center.add_many(to_add)
+        except Exception:
+            pass
+        # 메일 — 받은함만 (새 메일 알림은 받은함 기준)
+        try:
+            from mail import fetch_mail_list
+            ok, mitems = fetch_mail_list(self.session, kind="recv")
+            if ok and isinstance(mitems, list):
+                to_add = []
+                for it in mitems:
+                    if it.is_read:
+                        continue
+                    to_add.append(NotificationItem(
+                        type="mail",
+                        item_id=it.mail_id,
+                        sender=it.sender,
+                        summary=it.subject,
+                        timestamp=it.date,
+                        extra=it,
+                    ))
+                center.add_many(to_add)
+        except Exception:
+            pass
+
+    def _open_memo_from_notification(self, notif):
+        """알림 센터에서 쪽지 알림을 열 때 호출."""
+        try:
+            from memo import fetch_memo, MemoViewDialog
+            ok, content = fetch_memo(self.session, notif.item_id, kind="recv")
+            if not ok:
+                speak("쪽지를 불러오지 못했습니다.")
+                wx.MessageBox(f"쪽지를 불러오지 못했습니다.\n{content}",
+                              "오류", wx.OK | wx.ICON_ERROR, self)
+                return
+            dlg = MemoViewDialog(self, self.session, content)
+            dlg.ShowModal()
+            dlg.Destroy()
+        except Exception as e:
+            wx.MessageBox(f"쪽지 열기 실패.\n{e}", "오류",
+                          wx.OK | wx.ICON_ERROR, self)
+
+    def _open_mail_from_notification(self, notif):
+        """알림 센터에서 메일 알림을 선택했을 때 — MailViewDialog 로 본문 표시."""
+        try:
+            from mail import fetch_mail_content, MailViewDialog
+            ok, content = fetch_mail_content(self.session, notif.item_id, kind="recv")
+            if not ok:
+                speak("메일을 불러오지 못했습니다.")
+                wx.MessageBox(f"메일을 불러오지 못했습니다.\n{content}",
+                              "오류", wx.OK | wx.ICON_ERROR, self)
+                return
+            dlg = MailViewDialog(self, self.session, content)
+            dlg.ShowModal()
+            dlg.Destroy()
+        except Exception as e:
+            wx.MessageBox(f"메일 열기 실패.\n{e}", "오류",
+                          wx.OK | wx.ICON_ERROR, self)
+
+    # ── 쪽지 실시간 알림 ──
+
+    def _start_memo_notifier(self):
+        """백그라운드 알림 폴링 시작 — 쪽지(Memo) + 메일(Mail) 둘 다.
+
+        사용자 설정에 따라 각각 on/off 가능. 주기는 공통.
+        메일은 MemoNotifier 가 tick 마다 같이 poll_once_async 를 호출하는 방식.
+        """
+        if not self.session:
+            return
+        try:
+            from memo import MemoNotifier
+            from mail import MailNotifier
+            from settings_dialog import load_notify_settings
+            settings = load_notify_settings()
+            interval = int(settings.get("interval_sec", 60))
+            check_memo = bool(settings.get("check_memo", True))
+            check_mail = bool(settings.get("check_mail", True))
+            if interval <= 0 or (not check_memo and not check_mail):
+                self._memo_notifier = None
+                self._mail_notifier = None
+                return
+            self._mail_notifier = None
+            if check_mail:
+                self._mail_notifier = MailNotifier(self, self.session)
+                self._mail_notifier.start_initial_fill()
+            if check_memo:
+                self._memo_notifier = MemoNotifier(self, self.session, self._on_new_memo_or_mail)
+                # tick 시 mail 도 함께 체크하도록 hook
+                self._memo_notifier._piggyback_mail = self._poll_mail_from_memo_tick
+                # MemoNotifier 의 _check_in_bg 마지막에 piggyback 호출 필요 — wrap 대신
+                # 여기서는 wx.Timer 로 별도 타이머 안 쓰고 MemoNotifier tick 이 돌면서
+                # 메일도 같이 체크되게끔 wx.Timer 에 추가 Bind.
+                import wx as _wx
+                self._mail_timer = _wx.Timer(self)
+                self.Bind(_wx.EVT_TIMER, self._on_mail_tick, self._mail_timer)
+                self._mail_timer.Start(interval * 1000)
+                self._memo_notifier.start(interval_sec=interval)
+            else:
+                # 쪽지 체크 안 하고 메일만
+                import wx as _wx
+                self._memo_notifier = None
+                self._mail_timer = _wx.Timer(self)
+                self.Bind(_wx.EVT_TIMER, self._on_mail_tick, self._mail_timer)
+                self._mail_timer.Start(interval * 1000)
+        except Exception:
+            self._memo_notifier = None
+            self._mail_notifier = None
+
+    def _on_mail_tick(self, event):
+        """메일 폴링 tick — 새 메일이 있으면 알림 센터에 추가 + 알림."""
+        if not getattr(self, "_mail_notifier", None):
+            return
+        self._mail_notifier.poll_once_async(on_new_items=self._on_new_mail)
+
+    def _poll_mail_from_memo_tick(self):
+        """호환용 no-op."""
+        pass
+
+    def _on_new_memo_or_mail(self, count, new_items):
+        """기존 _on_new_memo 의 래퍼 — 이름만 의미 명확히."""
+        self._on_new_memo(count, new_items)
+
+    def _on_new_mail(self, new_items):
+        """새 메일 도착 — 알림 센터에 등록 + 사운드/TTS/대화상자."""
+        count = len(new_items)
+        if count == 0:
+            return
+        try:
+            from notification import NotificationItem, get_center
+            center = get_center()
+            to_add = [
+                NotificationItem(
+                    type="mail", item_id=it.mail_id,
+                    sender=it.sender, summary=it.subject,
+                    timestamp=it.date, extra=it,
+                ) for it in new_items
+            ]
+            center.add_many(to_add)
+        except Exception:
+            pass
+        try:
+            from sound import play_event
+            play_event("memo_new")
+        except Exception:
+            pass
+        self._unread_mail_count += count
+        self._update_title_unread()
+        sender = new_items[0].sender if new_items else "알 수 없음"
+        if count == 1:
+            speak(f"새 메일이 도착했습니다. 보낸 사람 {sender}")
+        else:
+            speak(f"새 메일이 {count}개 도착했습니다.")
+        if count == 1:
+            msg = (
+                f"새 메일이 도착했습니다.\n"
+                f"보낸 사람: {sender}\n"
+                f"제목: {new_items[0].subject}\n\n"
+                f"알림 센터를 여시겠습니까?"
+            )
+        else:
+            msg = f"새 메일이 {count}개 도착했습니다.\n\n알림 센터를 여시겠습니까?"
+        ans = wx.MessageBox(msg, "새 메일 도착",
+                            wx.YES_NO | wx.ICON_INFORMATION, self)
+        if ans == wx.YES:
+            self.on_memo_check_now(None)
+
+    def restart_memo_notifier(self):
+        """설정 변경 후 호출 — 기존 타이머 중단 후 새 주기로 재시작."""
+        try:
+            if getattr(self, "_memo_notifier", None):
+                self._memo_notifier.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_mail_timer", None):
+                self._mail_timer.Stop()
+        except Exception:
+            pass
+        self._memo_notifier = None
+        self._mail_notifier = None
+        self._mail_timer = None
+        self._start_memo_notifier()
+
+    def _on_new_memo(self, count: int, new_items: list):
+        """새 쪽지 도착 콜백 — 알림 센터에 등록 + 사운드·TTS·제목바 업데이트.
+
+        자동 폴링에서 호출됨. 사용자가 원본을 열 때는 알림 센터에서 선택하여 연다.
+        """
+        # 1. 알림 센터에 등록
+        try:
+            from notification import NotificationItem, get_center
+            center = get_center()
+            to_add = [
+                NotificationItem(
+                    type="memo", item_id=it.me_id,
+                    sender=it.counterpart, summary=it.summary,
+                    timestamp=it.date, extra=it,
+                ) for it in new_items
+            ]
+            center.add_many(to_add)
+        except Exception:
+            pass
+
+        # 2. 사운드
+        try:
+            from sound import play_event
+            play_event("memo_new")
+        except Exception:
+            pass
+
+        # 3. 제목바 갱신
+        self._unread_memo_count += count
+        self._update_title_unread()
+
+        # 4. TTS
+        sender = new_items[0].counterpart if new_items else "알 수 없음"
+        if count == 1:
+            speak(f"새 쪽지가 도착했습니다. 보낸 사람 {sender}")
+        else:
+            speak(f"새 쪽지가 {count}개 도착했습니다.")
+
+        # 5. 확인 대화상자 — Yes 면 알림 센터 오픈
+        if count == 1:
+            msg = (
+                f"새 쪽지가 도착했습니다.\n"
+                f"보낸 사람: {sender}\n\n"
+                f"알림 센터를 여시겠습니까?"
+            )
+        else:
+            msg = (
+                f"새 쪽지가 {count}개 도착했습니다.\n\n"
+                f"알림 센터를 여시겠습니까?"
+            )
+        ans = wx.MessageBox(msg, "새 쪽지 도착",
+                            wx.YES_NO | wx.ICON_INFORMATION, self)
+        if ans == wx.YES:
+            self.on_memo_check_now(None)
+
+    def _update_title_unread(self):
+        """제목바에 안 읽은 쪽지·메일 개수 표시 (있을 때만)."""
+        base = getattr(self, "_base_title", APP_NAME)
+        memo_count = getattr(self, "_unread_memo_count", 0)
+        mail_count = getattr(self, "_unread_mail_count", 0)
+        parts = []
+        if memo_count > 0:
+            parts.append(f"새 쪽지 {memo_count}")
+        if mail_count > 0:
+            parts.append(f"새 메일 {mail_count}")
+        if parts:
+            self.SetTitle(f"{base} - {' · '.join(parts)}")
+        else:
+            self.SetTitle(base)
+
+    def on_open_memo_compose(self, event):
+        """도구 > 쪽지 쓰기 (Ctrl+Shift+M)."""
+        try:
+            from memo import MemoWriteDialog
+            dlg = MemoWriteDialog(self, self.session)
+            dlg.ShowModal()
+            dlg.Destroy()
+        except Exception as e:
+            speak("쪽지 작성 중 오류가 발생했습니다.")
+            wx.MessageBox(f"쪽지 작성 중 오류가 발생했습니다.\n{e}",
+                          "오류", wx.OK | wx.ICON_ERROR, self)
+
+    def on_open_mail_compose(self, event):
+        """도구 > 메일함 열기 (Ctrl+Shift+E) — 사이트 내 메일함.
+        기존 "메일 보내기 (formmail)" 는 Alt+E 관리자 메일 메뉴에서 계속 사용 가능."""
+        try:
+            from mail import MailInboxDialog
+            dlg = MailInboxDialog(self, self.session)
+            dlg.ShowModal()
+            dlg.Destroy()
+            # 메일함을 직접 열었으니 안 읽은 메일 카운트 초기화
+            self._unread_mail_count = 0
+            self._update_title_unread()
+            notifier = getattr(self, "_mail_notifier", None)
+            if notifier is not None:
+                try:
+                    from mail import fetch_mail_list
+                    ok, items = fetch_mail_list(self.session, kind="recv")
+                    if ok and isinstance(items, list):
+                        for it in items:
+                            notifier.seen_ids.add(it.mail_id)
+                except Exception:
+                    pass
+        except Exception as e:
+            speak("메일함을 여는 중 오류가 발생했습니다.")
+            wx.MessageBox(f"메일함을 여는 중 오류가 발생했습니다.\n{e}",
+                          "오류", wx.OK | wx.ICON_ERROR, self)
 
     def on_exit(self, event):
         self.Close()
