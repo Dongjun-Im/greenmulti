@@ -2481,7 +2481,10 @@ class MainFrame(wx.Frame):
             apply_theme(dlg, make_font(self.current_font_size))
         except Exception:
             pass
-        speak(f"새 버전 {info.version}이 있습니다. 업데이트하시겠습니까?")
+        speak(
+            f"초록멀티 버전 {info.version} 업데이트가 있습니다. "
+            f"현재 버전은 {APP_VERSION}입니다. 업데이트하시겠습니까?"
+        )
         result = dlg.ShowModal()
         dlg.Destroy()
 
@@ -2526,6 +2529,27 @@ class MainFrame(wx.Frame):
         )
         webbrowser.open(url)
 
+    @staticmethod
+    def _update_beep(percent: int):
+        """업데이트 진행률이 10% 단위로 넘어갈 때 짧은 비프 재생.
+
+        진행률이 높아질수록 주파수가 올라가 청각적으로 진행을 인지하도록 함.
+        사운드 마스터 스위치가 꺼져 있으면 재생 안 함.
+        """
+        try:
+            from sound import load_sound_settings
+            if not load_sound_settings().get("enabled", True):
+                return
+        except Exception:
+            pass
+        try:
+            import winsound
+            # 0 → 500Hz, 100 → 1500Hz
+            freq = 500 + max(0, min(100, percent)) * 10
+            winsound.Beep(freq, 60)
+        except Exception:
+            pass
+
     def _download_and_install_exe(self, info: ReleaseInfo):
         """설치형 업데이트: .exe 다운로드 후 SILENT 설치."""
         dest_dir = get_download_dir()
@@ -2548,10 +2572,17 @@ class MainFrame(wx.Frame):
                   | wx.PD_AUTO_HIDE,
         )
 
-        state = {"cancelled": False, "error": None, "path": None}
+        state = {"cancelled": False, "error": None, "path": None, "bucket": -1}
 
         def progress_cb(downloaded: int, total: int) -> bool:
             # 워커 스레드에서 호출됨. UI 갱신은 CallAfter.
+            # 10% 단위(bucket)로 넘어갈 때마다 비프 재생.
+            if total > 0:
+                percent = int(downloaded / total * 100)
+                bucket = percent // 10
+                if bucket > state["bucket"]:
+                    state["bucket"] = bucket
+                    wx.CallAfter(self._update_beep, bucket * 10)
             def ui_update():
                 if state["cancelled"]:
                     return
@@ -2728,9 +2759,15 @@ class MainFrame(wx.Frame):
                   | wx.PD_ELAPSED_TIME | wx.PD_REMAINING_TIME
                   | wx.PD_AUTO_HIDE,
         )
-        state = {"cancelled": False, "error": None, "path": None}
+        state = {"cancelled": False, "error": None, "path": None, "bucket": -1}
 
         def progress_cb(downloaded, total):
+            if total > 0:
+                percent = int(downloaded / total * 100)
+                bucket = percent // 10
+                if bucket > state["bucket"]:
+                    state["bucket"] = bucket
+                    wx.CallAfter(self._update_beep, bucket * 10)
             def ui():
                 if state["cancelled"]:
                     return
@@ -2872,9 +2909,15 @@ class MainFrame(wx.Frame):
             maximum=1000, parent=self,
             style=wx.PD_APP_MODAL | wx.PD_ELAPSED_TIME | wx.PD_AUTO_HIDE,
         )
-        extract_state = {"cancelled": False, "error": None}
+        extract_state = {"cancelled": False, "error": None, "bucket": -1}
 
         def xprog(done, total):
+            if total > 0:
+                percent = int(done / total * 100)
+                bucket = percent // 10
+                if bucket > extract_state["bucket"]:
+                    extract_state["bucket"] = bucket
+                    wx.CallAfter(self._update_beep, bucket * 10)
             def ui():
                 if total > 0:
                     extract_dlg.Update(
@@ -2932,9 +2975,15 @@ class MainFrame(wx.Frame):
                   | wx.PD_ELAPSED_TIME | wx.PD_REMAINING_TIME
                   | wx.PD_AUTO_HIDE,
         )
-        state = {"cancelled": False, "error": None, "path": None}
+        state = {"cancelled": False, "error": None, "path": None, "bucket": -1}
 
         def progress_cb(downloaded, total):
+            if total > 0:
+                percent = int(downloaded / total * 100)
+                bucket = percent // 10
+                if bucket > state["bucket"]:
+                    state["bucket"] = bucket
+                    wx.CallAfter(self._update_beep, bucket * 10)
             def ui():
                 if state["cancelled"]:
                     return
@@ -3627,10 +3676,12 @@ class UpdateDialog(wx.Dialog):
     RESULT_SKIP_VERSION = 1003
 
     def __init__(self, parent, info, current_version: str, font_size: int):
+        # 대화상자 제목에도 숫자 버전을 명시해 스크린리더가 창 제목을 읽을 때
+        # 바로 버전을 알 수 있게 한다.
         super().__init__(
             parent,
-            title="초록멀티 업데이트 알림",
-            size=(560, 460),
+            title=f"초록멀티 업데이트 알림 — 새 버전 v{info.version}",
+            size=(560, 500),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
         self._info = info
@@ -3638,16 +3689,30 @@ class UpdateDialog(wx.Dialog):
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
+        # 헤더 — 릴리스 이름(코드명)이 아닌 숫자 버전을 크게 표시
         heading = wx.StaticText(
             panel,
-            label=f"새 버전 {info.version}이(가) 공개되었습니다.",
+            label=f"초록멀티 v{info.version} 업데이트가 공개되었습니다.",
         )
-        heading.SetFont(make_font(font_size + 2).Bold())
+        heading.SetFont(make_font(font_size + 3).Bold())
 
+        # 버전 비교 서브라인 — 한 줄에 명확하게
         sub = wx.StaticText(
             panel,
-            label=f"현재 버전: {current_version}     최신 버전: {info.version}",
+            label=(
+                f"현재 버전: v{current_version}"
+                f"   →   새 버전: v{info.version}"
+            ),
         )
+        sub.SetFont(make_font(font_size + 1).Bold())
+
+        # 태그 정보 부가 라인 (릴리스 name 이 버전과 다를 때만 안내 표시)
+        extra_lines = [f"릴리스 태그: {info.tag_name}"]
+        if info.name and info.name.strip() and info.name.strip() not in (
+            info.tag_name, info.version, f"v{info.version}",
+        ):
+            extra_lines.append(f"릴리스 이름: {info.name}")
+        meta = wx.StaticText(panel, label="\n".join(extra_lines))
 
         notes_label = wx.StaticText(panel, label="변경 사항(&N):")
         notes = wx.TextCtrl(
@@ -3669,6 +3734,7 @@ class UpdateDialog(wx.Dialog):
 
         sizer.Add(heading, 0, wx.ALL, 10)
         sizer.Add(sub, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        sizer.Add(meta, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         sizer.Add(notes_label, 0, wx.LEFT | wx.TOP, 10)
         sizer.Add(notes, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
