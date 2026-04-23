@@ -1,12 +1,12 @@
-; 초록멀티 v1.5 — Inno Setup 설치 스크립트
+; 초록멀티 v1.4 — Inno Setup 설치 스크립트
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.5.1"
-#define AppVersionDisplay "v1.5"
+#define AppVersion "1.4.1"
+#define AppVersionDisplay "v1.4"
 #define AppPublisher "초록등대 동호회"
-#define AppExeName "초록멀티 v1.5.exe"
-#define AppDistName "초록멀티 v1.5"
+#define AppExeName "초록멀티 v1.4.exe"
+#define AppDistName "초록멀티 v1.4"
 
 [Setup]
 AppId={{B3F9A4D2-5E7C-4F8B-A1D6-3E2C7B8F9A01}
@@ -19,7 +19,7 @@ DefaultDirName={autopf}\{#AppName} {#AppVersionDisplay}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=installer_out
-OutputBaseFilename=초록멀티_v1.5_setup
+OutputBaseFilename=초록멀티_v1.4_setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
