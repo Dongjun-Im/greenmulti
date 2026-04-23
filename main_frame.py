@@ -2454,11 +2454,13 @@ class MainFrame(wx.Frame):
 
         if not is_newer(APP_VERSION, info.version):
             if manual:
-                speak(f"현재 버전이 최신입니다. {APP_VERSION}")
+                speak(
+                    f"현재 사용 중인 버전 {APP_VERSION} 이 최신입니다."
+                )
                 wx.MessageBox(
                     f"현재 사용 중인 버전이 최신입니다.\n"
-                    f"설치 버전: {APP_VERSION}\n"
-                    f"최신 버전: {info.version}",
+                    f"설치 버전 {APP_VERSION}\n"
+                    f"최신 버전 {info.version}",
                     "최신 버전 사용 중",
                     wx.OK | wx.ICON_INFORMATION, self,
                 )
@@ -3677,10 +3679,11 @@ class UpdateDialog(wx.Dialog):
 
     def __init__(self, parent, info, current_version: str, font_size: int):
         # 대화상자 제목에도 숫자 버전을 명시해 스크린리더가 창 제목을 읽을 때
-        # 바로 버전을 알 수 있게 한다.
+        # 바로 버전을 알 수 있게 한다. 스크린리더가 어색하게 읽는 특수기호
+        # (:, →, —, v 접두사)는 피하고 숫자 버전과 자연스러운 한글만 사용.
         super().__init__(
             parent,
-            title=f"초록멀티 업데이트 알림 — 새 버전 v{info.version}",
+            title=f"초록멀티 업데이트 알림 - 새 버전 {info.version}",
             size=(560, 500),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
@@ -3689,30 +3692,34 @@ class UpdateDialog(wx.Dialog):
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # 헤더 — 릴리스 이름(코드명)이 아닌 숫자 버전을 크게 표시
+        # 헤더 — 숫자 버전을 크게 표시
         heading = wx.StaticText(
             panel,
-            label=f"초록멀티 v{info.version} 업데이트가 공개되었습니다.",
+            label=f"초록멀티 {info.version} 업데이트가 공개되었습니다.",
         )
         heading.SetFont(make_font(font_size + 3).Bold())
 
-        # 버전 비교 서브라인 — 한 줄에 명확하게
+        # 버전 비교 서브라인 — 기호 없이 한글 문장으로
         sub = wx.StaticText(
             panel,
             label=(
-                f"현재 버전: v{current_version}"
-                f"   →   새 버전: v{info.version}"
+                f"현재 버전 {current_version} 에서 "
+                f"새 버전 {info.version} 으로 업데이트됩니다."
             ),
         )
         sub.SetFont(make_font(font_size + 1).Bold())
 
-        # 태그 정보 부가 라인 (릴리스 name 이 버전과 다를 때만 안내 표시)
-        extra_lines = [f"릴리스 태그: {info.tag_name}"]
+        # 릴리스 이름이 버전 숫자와 다를 때만 간단히 안내. 릴리스 태그는
+        # 버전과 중복 정보라 표시하지 않음.
+        extra_lines = []
         if info.name and info.name.strip() and info.name.strip() not in (
             info.tag_name, info.version, f"v{info.version}",
+            f"초록멀티 {info.version}", f"초록멀티 v{info.version}",
         ):
-            extra_lines.append(f"릴리스 이름: {info.name}")
-        meta = wx.StaticText(panel, label="\n".join(extra_lines))
+            extra_lines.append(f"릴리스 이름 {info.name}")
+        meta = wx.StaticText(
+            panel, label="\n".join(extra_lines) if extra_lines else "",
+        )
 
         notes_label = wx.StaticText(panel, label="변경 사항(&N):")
         notes = wx.TextCtrl(

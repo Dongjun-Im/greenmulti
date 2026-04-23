@@ -120,7 +120,11 @@ jobs:
           name: 초록멀티 ${{ steps.vars.outputs.tag }}
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(steps.vars.outputs.version, '-') }}
+          # 태그 이름에 하이픈이 있으면(예: v1.6.0-beta.1) 프리릴리스, 아니면 정식 릴리스.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # 정식 릴리스일 때 /releases/latest 가 이 릴리스를 가리키도록 명시.
+          # (prerelease 와는 배타적이므로 태그에 하이픈이 있으면 이 설정은 무시됨)
+          make_latest: ${{ !contains(github.ref_name, '-') && 'true' || 'legacy' }}
           files: |
             installer_out/*.exe
             installer_out/*.sha256
