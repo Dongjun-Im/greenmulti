@@ -2,7 +2,7 @@
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.5.2"
+#define AppVersion "1.5.3"
 #define AppVersionDisplay "v1.5"
 #define AppPublisher "초록등대 동호회"
 #define AppExeName "초록멀티 v1.5.exe"
