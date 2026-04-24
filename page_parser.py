@@ -41,6 +41,50 @@ def _is_real_delete_url(url: str) -> bool:
     return ("delete_comment" in u) or ("delete.php" in u)
 
 
+def extract_post_author_id(html: str) -> str:
+    """게시글 본문 페이지 HTML 에서 작성자의 mb_id(소리샘 로그인 아이디)를 추출.
+
+    gnuboard 계열 사이트는 작성자 영역(.bo_v_info / .view_header 등) 안에 프로필
+    링크 `.../profile.php?mb_id=XXX` 또는 `javascript:winprofile('XXX')` 형태로
+    작성자 아이디를 노출한다. 이걸 바탕으로 현재 로그인한 사용자와 일치하는지
+    클라이언트 측에서 검증하는 데 사용된다.
+
+    추출 실패 시 빈 문자열. 호출자는 빈 값일 때 안전하게 거부(본인 아님으로 간주)
+    하는 쪽이 기본 정책.
+    """
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        return ""
+
+    # 게시글 상세 페이지에서 작성자 정보가 위치하는 후보 영역.
+    author_region_selectors = [
+        "#bo_v_info", ".bo_v_info",
+        ".view_header", ".post_info",
+        ".view_title", ".bo_v_tit",
+        ".board_view_info",
+    ]
+
+    for sel in author_region_selectors:
+        for el in soup.select(sel):
+            for a in el.find_all("a", href=True):
+                href = a["href"]
+                # 1) URL 파라미터: ?mb_id=X, &mb_id=X
+                m = re.search(r"[?&]mb_id=([^&'\"<>\s]+)", href)
+                if m:
+                    return m.group(1).strip()
+                # 2) javascript 프로필 팝업: winprofile('X') / member_info('X')
+                m = re.search(
+                    r"(?:winprofile|member_info|mb_info)\s*\(\s*['\"]([^'\"]+)['\"]",
+                    href,
+                )
+                if m:
+                    return m.group(1).strip()
+    return ""
+
+
 def _extract_display_name(el) -> str:
     """HTML 요소에서 작성자 표시 이름(닉네임/이름)을 추출한다.
     아이디 대신 닉네임 우선."""
@@ -251,14 +295,67 @@ def _is_noise_link(href: str, text: str) -> bool:
     return False
 
 
-def parse_sub_menus(html: str) -> list[SubMenuItem]:
+def parse_sub_menus(html: str, base_url: str = "") -> list[SubMenuItem]:
     """
     페이지에서 하위 메뉴(서브 링크)를 추출한다.
     페이지네이션, 게시글 링크 등은 제외한다.
+
+    base_url:
+        현재 보고 있는 페이지의 URL. 전달되면 이 URL 이 가리키는 클럽/범위와
+        다른 영역으로 향하는 링크를 걸러낸다. 예: base_url 이
+        `/plugin/ar.club/?cl=green4` 이면 `cl=green4` 외의 `cl=다른값`을 가진
+        링크는 최상위 내비게이션으로 간주하고 제외한다. 이를 통해 클럽 하위
+        페이지에서 "일반 동호회", "초록 등대" 같은 상위 카테고리가 섞여
+        표시되는 문제를 막는다.
     """
     soup = BeautifulSoup(html, "lxml")
     items = []
     seen_urls = set()
+
+    # base_url 에서 현재 활성 클럽 코드(cl=X) 를 추출. 이후 필터에 사용.
+    current_cl = ""
+    if base_url:
+        m = re.search(r"[?&]cl=([^&#]+)", base_url)
+        if m:
+            current_cl = m.group(1).strip().lower()
+
+    def _is_out_of_scope(href: str) -> bool:
+        """현재 클럽 컨텍스트에서 벗어난 상위 내비게이션인지 판정.
+
+        소리샘은 `?mo=X&cl=Y` 형식으로 "Y 클럽의 X 섹션" 링크를 표현한다.
+        따라서 부모 클럽을 가리키는 cl= 여도 mo= 가 함께 있으면 "부모의 특정
+        섹션"이므로 breadcrumb이 아니라 실제 하위 메뉴 항목이다.
+
+        판정 흐름:
+          - cl= 없음 → 판단 불가, 통과
+          - cl=<값> == current_cl → 같은 클럽, 통과
+          - 공통 접두사 < 3자 → 무관한 카테고리, 제외
+          - current_cl 이 cl_val 의 접두사 (부모 클럽) AND mo= 없음 → breadcrumb 제외
+          - current_cl 이 cl_val 의 접두사 AND mo= 있음 → 부모의 섹션 링크, 통과
+          - 그 외 (형제/자식 관계) → 통과
+        """
+        if not current_cl:
+            return False
+        href_lower = href.lower() if href else ""
+        m2 = re.search(r"[?&]cl=([^&#]+)", href_lower)
+        if not m2:
+            return False
+        cl_val = m2.group(1).strip().lower()
+        if cl_val == current_cl:
+            return False
+        # 공통 접두사 길이 계산
+        common_len = 0
+        for c1, c2 in zip(cl_val, current_cl):
+            if c1 == c2:
+                common_len += 1
+            else:
+                break
+        if common_len < 3:
+            return True  # 무관한 클럽 (예: green → circle)
+        has_mo = bool(re.search(r"[?&]mo=", href_lower))
+        if current_cl.startswith(cl_val) and not has_mo:
+            return True  # 부모 breadcrumb (예: green4 → green 단독 링크)
+        return False  # 형제/자식/부모의 섹션(mo= 포함) → 통과
 
     def _collect_links(link_elements):
         for link in link_elements:
@@ -271,6 +368,9 @@ def parse_sub_menus(html: str) -> list[SubMenuItem]:
                 continue
             if "wr_id=" in href:
                 continue
+            # 현재 클럽과 무관한 다른 클럽/카테고리 링크 차단
+            if _is_out_of_scope(href):
+                continue
 
             # 소리샘 URL은 상대 경로로 변환, 외부 링크는 그대로 유지
             if href.startswith("http") and SORISEM_BASE_URL in href:
@@ -280,8 +380,12 @@ def parse_sub_menus(html: str) -> list[SubMenuItem]:
                 seen_urls.add(href)
                 items.append(SubMenuItem(text, href))
 
-    # 1단계: 특정 네비게이션 영역에서 링크 추출
-    nav_selectors = [
+    # 1·2단계: 네비게이션 + 본문 영역 선택자에서 링크 추출. 두 단계를 병합해
+    # 한쪽이 소수의 항목만 가진 경우에도 다른 쪽 항목을 놓치지 않는다. 예전에
+    # 1단계에서 1~2 항목이 잡히면 2단계가 스킵되어 자식 클럽 목록을 통째로
+    # 놓치는 문제를 방지한다.
+    primary_selectors = [
+        # nav
         "#c_menu a",
         "#c_aside a",
         ".side_menu a",
@@ -291,37 +395,38 @@ def parse_sub_menus(html: str) -> list[SubMenuItem]:
         ".sub_menu a",
         ".category a",
         ".menu_list a",
-    ]
-
-    for selector in nav_selectors:
-        _collect_links(soup.select(selector))
-
-    if items:
-        return items
-
-    # 2단계: 본문 영역의 링크 추출 (특정 셀렉터에 없을 경우)
-    content_selectors = [
+        # content
         "#bo_list a",
         ".board_list a",
         "#content a",
         ".content a",
         "main a",
         "#container a",
+        # club listings
+        ".club_list a",
+        ".art_club a",
+        ".ar_club a",
+        ".art_club_list a",
     ]
 
-    for selector in content_selectors:
+    for selector in primary_selectors:
         _collect_links(soup.select(selector))
 
-    if items:
-        return items
-
-    # 3단계: 페이지 전체에서 의미 있는 링크 추출 (최후의 수단)
-    # header, footer, 스크립트 영역 제외
-    for tag in soup.find_all(["header", "footer", "script", "style", "nav"]):
+    # 3단계를 항상 함께 실행 — 1·2단계가 일부만 포착할 때 누락을 방지.
+    # header / footer / nav / 전역 메뉴 컨테이너를 제거한 사본을 따로 만들어
+    # 전체 페이지를 스캔한다. seen_urls 기반 dedup 이 중복을 차단.
+    soup_rest = BeautifulSoup(html, "lxml")
+    for tag in soup_rest.find_all(["header", "footer", "script", "style", "nav"]):
         tag.decompose()
-
-    all_links = soup.find_all("a", href=True)
-    _collect_links(all_links)
+    for sel in (
+        "#gnb", ".gnb", "#tnb", ".tnb", "#lnb", ".lnb", "#hd", ".hd",
+        "#top", ".top", "#top_menu", ".top_menu",
+        ".breadcrumb", ".breadcrumbs", ".crumb", ".location",
+        "#globalNav", ".global-nav", ".global_nav",
+    ):
+        for node in soup_rest.select(sel):
+            node.decompose()
+    _collect_links(soup_rest.find_all("a", href=True))
 
     return items
 

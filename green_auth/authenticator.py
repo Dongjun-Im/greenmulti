@@ -65,6 +65,11 @@ class Authenticator:
         self.session.headers.update({
             "User-Agent": "GreenAuth/1.0",
         })
+        # 인증 성공한 사용자의 소리샘 로그인 아이디.
+        # MainFrame 이 본인 게시물 여부 검증 등에 사용한다.
+        self.user_id: str | None = None
+        # 로그인 사용자의 닉네임 (게시물 작성자 일치 여부 검증용).
+        self.nickname: str | None = None
 
     def authenticate(self, user_id: str, password: str) -> AuthResult:
         """소리샘 로그인 후 초록등대 동호회 회원 등급을 확인한다."""
@@ -72,7 +77,113 @@ class Authenticator:
         if not login_result.is_success:
             return login_result
 
-        return self._check_green_membership(user_id)
+        result = self._check_green_membership(user_id)
+        if result.is_success:
+            self.user_id = user_id
+            self.nickname = self._fetch_my_nickname(user_id)
+        return result
+
+    # ─────────────────────────── 닉네임 조회 ───────────────────────────
+
+    def _fetch_my_nickname(self, user_id: str) -> str | None:
+        """로그인 사용자의 소리샘 닉네임을 조회. 실패해도 앱 실행엔 지장 없도록
+        None 반환. 이후 본인 게시물 여부 검증에서 닉네임이 없으면 다른 전략으로
+        폴백된다.
+
+        gnuboard 계열은 `/bbs/profile.php?mb_id=X` 가 사용자 프로필 페이지를
+        돌려주므로 여기서 닉네임을 추출하는 것이 가장 안정적. 실패 시 메인
+        페이지의 로그인 영역을 2차로 탐색."""
+        nick = self._fetch_nickname_from_profile(user_id)
+        if nick:
+            return nick
+        return self._fetch_nickname_from_main()
+
+    def _fetch_nickname_from_profile(self, user_id: str) -> str | None:
+        try:
+            url = f"{SORISEM_BASE_URL}/bbs/profile.php?mb_id={user_id}"
+            resp = self.session.get(url, timeout=15)
+        except Exception:
+            return None
+        if not resp.ok:
+            return None
+
+        try:
+            soup = BeautifulSoup(resp.text, "lxml")
+        except Exception:
+            return None
+
+        # 1) 일반적인 프로필 닉네임 선택자
+        for sel in [
+            ".mb_nick", ".prof_nick", ".nickname",
+            "#profile_nick", ".profile_nick",
+            ".profile-name", ".prof-name",
+            ".sv_name", ".if_name", ".mb_name",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                text = self._clean_nickname(el.get_text(strip=True))
+                if text:
+                    return text
+
+        # 2) 페이지 title: "XXX님의 정보" 패턴
+        if soup.title:
+            m = re.search(
+                r"([^\s<>]{1,30})\s*님(?:의)?\s*(?:정보|프로필|페이지)?",
+                soup.title.get_text(strip=True),
+            )
+            if m:
+                return self._clean_nickname(m.group(1))
+
+        # 3) h1/h2 헤더
+        for sel in ("h1", "h2", "h3"):
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(strip=True)
+                m = re.search(r"([^\s<>]{1,30})\s*님", text)
+                if m:
+                    return self._clean_nickname(m.group(1))
+                # "닉네임 프로필" 같은 패턴
+                if 1 < len(text) < 30 and not text.lower().startswith(
+                    ("profile", "정보")
+                ):
+                    return self._clean_nickname(text)
+        return None
+
+    def _fetch_nickname_from_main(self) -> str | None:
+        try:
+            resp = self.session.get(SORISEM_BASE_URL, timeout=15)
+        except Exception:
+            return None
+        if not resp.ok:
+            return None
+
+        html = resp.text
+        # 로그인 상태에서 헤더/상단에 "XXX님 환영합니다" 또는 "XXX님" + 근처 로그아웃
+        # 링크가 표시되는 일반 gnuboard 패턴을 탐색.
+        for pattern in [
+            r"([^\s<>\n]{1,30})\s*님[^<>]{0,50}?(?:환영|안녕|반갑|hello)",
+            r"([^\s<>\n]{1,30})\s*님[\s\S]{0,250}?로그아웃",
+            r"로그아웃[\s\S]{0,250}?([^\s<>\n]{1,30})\s*님",
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                cand = self._clean_nickname(m.group(1))
+                if cand:
+                    return cand
+        return None
+
+    @staticmethod
+    def _clean_nickname(text: str) -> str:
+        if not text:
+            return ""
+        text = re.sub(r"<[^>]+>", "", text).strip()
+        for suffix in ("님의 정보", "님 정보", "의 정보", "의정보", "님"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+        text = re.sub(r"\s+", " ", text)
+        if 1 < len(text) < 30:
+            return text
+        return ""
 
     def _login(self, user_id: str, password: str) -> AuthResult:
         """소리샘 사이트 로그인"""

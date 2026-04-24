@@ -102,7 +102,9 @@ class CommentDialog(wx.Dialog):
 class PostDialog(wx.Dialog):
     """게시물 내용을 표시하는 대화상자"""
 
-    def __init__(self, parent, content: PostContent, session: requests.Session):
+    def __init__(self, parent, content: PostContent, session: requests.Session,
+                 current_user_id: str | None = None,
+                 current_user_nickname: str | None = None):
         title = content.title if content.title else "게시물 내용"
         super().__init__(
             parent, title=title,
@@ -112,6 +114,9 @@ class PostDialog(wx.Dialog):
 
         self.content = content
         self.session = session
+        # 로그인한 사용자의 소리샘 아이디·닉네임. 본인 게시물 여부 검증에 사용.
+        self.current_user_id = current_user_id
+        self.current_user_nickname = current_user_nickname
 
         # 첨부파일/댓글 유무를 명확하게 판단
         self.has_files = isinstance(content.files, list) and len(content.files) > 0
@@ -1010,13 +1015,91 @@ class PostDialog(wx.Dialog):
 
     # ── 게시물 수정/삭제/답변 ──
 
+    def _names_match(self, a: str | None, b: str | None) -> bool:
+        """닉네임 두 개가 같은 사람을 가리키는지 판단. 대소문자·공백·존칭 정규화."""
+        def norm(s: str | None) -> str:
+            if not s:
+                return ""
+            s = re.sub(r"<[^>]+>", "", s).strip()
+            for suf in ("님의 정보", "님 정보", "님", "씨"):
+                if s.endswith(suf):
+                    s = s[: -len(suf)].strip()
+            s = re.sub(r"\s+", " ", s)
+            return s.lower()
+        na, nb = norm(a), norm(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        if na in nb or nb in na:
+            return True
+        return False
+
+    def _verify_own_post(self) -> tuple[bool, str]:
+        """이 게시물이 현재 로그인 사용자의 글인지 확인.
+
+        판단 순서 (main_frame._verify_post_ownership 과 동일한 정책):
+          1) 로그인 닉네임과 게시물 작성자 닉네임 비교 (HTTP 호출 없음, 가장 빠름)
+          2) 본문 페이지에서 작성자 mb_id 추출 후 current_user_id 와 비교
+          3) 두 방법 모두 판단 불가 → 서버 기본 권한 체크에 맡기기 위해 허용.
+
+        반환: (True, "") 본인 / (False, 사유) 타인.
+        """
+        if not self.current_user_id:
+            return False, "로그인 사용자 정보를 확인할 수 없어 수정·삭제를 중단합니다."
+        if not self.content.bo_table or not self.content.wr_id:
+            return False, "게시물 식별자를 확인할 수 없어 수정·삭제를 중단합니다."
+
+        # 1) 닉네임 비교
+        if self.current_user_nickname and self.content.author:
+            if self._names_match(self.current_user_nickname, self.content.author):
+                return True, ""
+            return False, "본인이 작성한 게시물만 수정·삭제할 수 있습니다."
+
+        # 2) mb_id 추출 비교
+        try:
+            post_url = (
+                f"{SORISEM_BASE_URL}/bbs/board.php?"
+                f"bo_table={self.content.bo_table}&wr_id={self.content.wr_id}"
+            )
+            resp = self.session.get(post_url, timeout=15)
+        except Exception:
+            return True, ""
+
+        from page_parser import extract_post_author_id
+        author_id = extract_post_author_id(resp.text)
+        if author_id:
+            if author_id.strip().lower() == self.current_user_id.strip().lower():
+                return True, ""
+            return False, "본인이 작성한 게시물만 수정·삭제할 수 있습니다."
+
+        # 3) 판단 불가 — 서버 기본 권한 체크에 맡김
+        return True, ""
+
     def on_post_edit(self, event):
         """게시물 수정"""
         if not self.content.edit_url:
             speak("이 게시물은 수정할 수 없습니다. 본인이 작성한 글만 수정할 수 있습니다.")
             return
 
+        # 클라이언트측 작성자 검증: 서버가 관리자에게 수정 URL 을 제공해도
+        # 본인 글이 아니면 여기서 차단.
+        def verify_then_fetch():
+            owned, msg = self._verify_own_post()
+            if not owned:
+                wx.CallAfter(speak, msg)
+                wx.CallAfter(
+                    wx.MessageBox, msg, "수정 불가",
+                    wx.OK | wx.ICON_WARNING, self,
+                )
+                return
+            wx.CallAfter(self._do_post_edit)
+
         speak("수정 페이지를 불러오는 중입니다.")
+        threading.Thread(target=verify_then_fetch, daemon=True).start()
+
+    def _do_post_edit(self):
+        """검증 통과 후 실제 수정 페이지 로드."""
 
         def worker():
             try:
@@ -1076,6 +1159,24 @@ class PostDialog(wx.Dialog):
             speak("이 게시물은 삭제할 수 없습니다. 본인이 작성한 글만 삭제할 수 있습니다.")
             return
 
+        # 클라이언트측 작성자 검증. 확인 대화상자 이전에 수행해야 "확인 → 본인
+        # 아님" 순서의 어색한 흐름을 피할 수 있다. 네트워크 요청이 필요하므로
+        # 별도 스레드에서 돌린 뒤 메인 스레드로 복귀해 대화상자를 띄운다.
+        def verify_then_confirm():
+            owned, msg = self._verify_own_post()
+            if not owned:
+                wx.CallAfter(speak, msg)
+                wx.CallAfter(
+                    wx.MessageBox, msg, "삭제 불가",
+                    wx.OK | wx.ICON_WARNING, self,
+                )
+                return
+            wx.CallAfter(self._confirm_and_delete_post)
+
+        threading.Thread(target=verify_then_confirm, daemon=True).start()
+
+    def _confirm_and_delete_post(self):
+        """작성자 검증 통과 후 확인 대화상자 → 실제 삭제."""
         result = wx.MessageBox(
             f"'{self.content.title}' 게시물을 삭제하시겠습니까?\n\n"
             "삭제하면 복구할 수 없습니다.",

@@ -13,19 +13,28 @@ class ChorokMultiApp(wx.App):
 
     def OnInit(self):
         self.session = None
+        self.user_id: str | None = None
+        self.user_nickname: str | None = None
         self._play_startup_sound()
         self._cleanup_old_update_artifacts()
 
         # 인증 절차 실행
-        self.session = run_authentication()
-        if self.session is None:
+        authenticator = run_authentication()
+        if authenticator is None:
             return False
+        self.session = authenticator.session
+        self.user_id = authenticator.user_id
+        self.user_nickname = authenticator.nickname
 
         # 인증 성공: 메뉴 자동 감지 후 메인 윈도우 표시
         self._auto_detect_menus()
 
         from main_frame import MainFrame
-        frame = MainFrame(self.session)
+        frame = MainFrame(
+            self.session,
+            current_user_id=self.user_id,
+            current_user_nickname=self.user_nickname,
+        )
         self.SetTopWindow(frame)
         return True
 

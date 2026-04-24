@@ -58,14 +58,14 @@ def _do_authenticate(user_id: str, password: str, silent: bool = False) -> tuple
     return False, None
 
 
-def run_authentication() -> requests.Session | None:
+def run_authentication() -> Authenticator | None:
     """
     초록등대 동호회 인증을 실행한다.
 
     이 함수를 호출하기 전에 wx.App이 생성되어 있어야 한다.
 
     Returns:
-        인증 성공 시 로그인된 requests.Session 객체,
+        인증 성공 시 Authenticator 객체 (session, user_id, nickname 모두 포함),
         실패 시 None
     """
     # 1. 저장된 자격 증명으로 자동 인증 시도
@@ -76,7 +76,9 @@ def run_authentication() -> requests.Session | None:
         wx.SafeYield()  # 음성 출력이 즉시 처리되도록
         success, authenticator = _do_authenticate(user_id, password, silent=True)
         if success:
-            return authenticator.session
+            if authenticator is not None and not authenticator.user_id:
+                authenticator.user_id = user_id
+            return authenticator
         # 자동 인증 실패 시 저장된 정보 삭제
         delete_credentials()
 
@@ -100,8 +102,10 @@ def run_authentication() -> requests.Session | None:
         if success:
             if should_save:
                 save_credentials(user_id, password)
+            if authenticator is not None and not authenticator.user_id:
+                authenticator.user_id = user_id
             dialog.Destroy()
-            return authenticator.session
+            return authenticator
 
     dialog.Destroy()
     return None

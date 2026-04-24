@@ -238,7 +238,9 @@ class GotoDialog(wx.Dialog):
 class MainFrame(wx.Frame):
     """초록멀티 메인 윈도우"""
 
-    def __init__(self, session: requests.Session):
+    def __init__(self, session: requests.Session,
+                 current_user_id: str | None = None,
+                 current_user_nickname: str | None = None):
         super().__init__(
             None,
             title=APP_NAME,
@@ -246,6 +248,13 @@ class MainFrame(wx.Frame):
         )
 
         self.session = session
+        # 현재 로그인한 사용자의 소리샘 아이디 (mb_id).
+        # 게시물 수정/삭제 시 본인 여부 검증에 사용.
+        self.current_user_id = current_user_id
+        # 현재 로그인한 사용자의 닉네임.
+        # 게시물 목록에 표시되는 작성자 닉네임(post.author)과 비교하여 본인
+        # 게시물 여부를 빠르게 판단 (서버 HTTP 호출 없이).
+        self.current_user_nickname = current_user_nickname
         self.menu_manager = MenuManager()
         self.menu_manager.load()
 
@@ -824,10 +833,14 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
-    def _show_sub_menu(self, sub_menus: list[SubMenuItem], menu_name: str):
+    def _show_sub_menu(self, sub_menus: list[SubMenuItem], menu_name: str,
+                       base_url: str = ""):
         self.current_view = VIEW_SUB_MENU
         self.current_menu_name = menu_name
         self.SetTitle(f"{APP_NAME} - {menu_name}")
+        # 현재 하위 메뉴 페이지의 소스 URL. 뒤따르는 필터가 cl=<code> 를 추출해
+        # 다른 클럽 카테고리 링크를 걸러내는 데 사용.
+        self.current_sub_menu_url = base_url
 
         clean_menu = re.sub(r'^\d+[\.\)]\s*', '', menu_name).strip() if menu_name else ""
 
@@ -842,10 +855,56 @@ class MainFrame(wx.Frame):
         if clean_menu:
             header_noise.add(clean_menu)
 
-        # 브레드크럼(경로) 필터링용: 메인 메뉴 URL 목록
+        # 메인 메뉴 URL / 바로가기 코드 집합 — 상위 내비게이션 식별 보조용.
+        from menu_manager import extract_shortcut_code
+
         main_menu_urls = {"/", ""}
+        main_menu_codes: set[str] = set()
         for mi in self.menu_manager.menus:
             main_menu_urls.add(mi.url)
+            code = extract_shortcut_code(mi.url)
+            if code:
+                main_menu_codes.add(code.strip().lower())
+
+        # 현재 보고 있는 페이지의 컨텍스트 코드. 우선순위:
+        # 1) 호출자가 넘긴 base_url  2) current_board_url  3) 비어있음
+        source_url = (
+            getattr(self, "current_sub_menu_url", "") or self.current_board_url or ""
+        )
+        current_cl = ""
+        m_cur = re.search(r"[?&]cl=([^&#]+)", source_url)
+        if m_cur:
+            current_cl = m_cur.group(1).strip().lower()
+        current_code = (
+            current_cl
+            or (extract_shortcut_code(source_url) or "").strip().lower()
+        )
+
+        # 클럽(ar.club)·현재 컨텍스트가 명확할 때 "화이트리스트 + 명시 거부"
+        # 방식으로 필터링. 블랙리스트(메인 메뉴 코드와 비교) 는 메인 메뉴에
+        # 없는 카테고리(예: circle)를 놓치기 때문에 휴리스틱을 추가한다.
+        strict_scope = bool(current_cl) and "ar.club" in source_url
+
+        # 진단 로그: 현재 하위 메뉴 필터링 결과를 파일로 남겨 어떤 URL 이 왜
+        # 유지/제외되는지 확인할 수 있게 한다. 사용자가 문제 상황에서 이 파일을
+        # 제공하면 필터 규칙을 정확히 맞출 수 있다.
+        from config import DATA_DIR
+        _diag_path = os.path.join(DATA_DIR, "submenu_filter.log")
+        _diag_lines = [
+            "=== _show_sub_menu 진단 ===",
+            f"menu_name     = {menu_name}",
+            f"base_url      = {base_url}",
+            f"source_url    = {source_url}",
+            f"current_cl    = {current_cl}",
+            f"current_code  = {current_code}",
+            f"strict_scope  = {strict_scope}",
+            f"main_menu_codes = {sorted(main_menu_codes)}",
+            f"raw sub_menus 개수 = {len(sub_menus)}",
+            "--- 전체 후보 목록 ---",
+        ]
+        for _i, _m in enumerate(sub_menus):
+            _diag_lines.append(f"  [{_i}] url={_m.url!r}  text={_m.name!r}")
+        _diag_lines.append("--- 필터 결과 ---")
 
         # 필터링된 하위메뉴와 표시 항목을 동기화
         filtered_subs = []
@@ -853,11 +912,101 @@ class MainFrame(wx.Frame):
         seen_texts = set()
         num = 1
         for m in sub_menus:
+            url = (m.url or "").strip()
+            url_lower = url.lower()
+
             # 브레드크럼(경로 안내) 링크 제거: 메인 메뉴 URL과 동일한 항목
-            if m.url in main_menu_urls:
+            if url in main_menu_urls:
                 continue
 
-            text = m.display_text
+            sub_code = (extract_shortcut_code(url) or "").strip().lower()
+
+            if strict_scope:
+                _reject_reason = None
+                has_mo = bool(re.search(r"[?&]mo=", url_lower))
+
+                # ─── mo= 취급: 단독이면 최상위, cl= 동반이면 관계 기반 판정 ───
+                if has_mo:
+                    _m_cl_in_mo = re.search(r"[?&]cl=([^&#]+)", url_lower)
+                    if not _m_cl_in_mo:
+                        _reject_reason = "R1 mo= top-level (no cl=)"
+                    else:
+                        _cl_in_mo = _m_cl_in_mo.group(1).strip().lower()
+                        _common_mo = 0
+                        for c1, c2 in zip(_cl_in_mo, current_cl):
+                            if c1 == c2:
+                                _common_mo += 1
+                            else:
+                                break
+                        if _cl_in_mo != current_cl and _common_mo < 3:
+                            _reject_reason = (
+                                f"R1 mo= unrelated cl={_cl_in_mo}"
+                            )
+                        # else: 동일/관련 클럽의 섹션 → 통과
+                elif re.search(r"[?&]clp=", url_lower):
+                    _reject_reason = "R1 clp="
+                elif url_lower.startswith(("http://", "https://")):
+                    _reject_reason = "R2 external"
+                elif url_lower in ("/", "") or url_lower.startswith("/mypage"):
+                    _reject_reason = "R3 home/mypage"
+
+                # ─── 클럽 코드 비교 (부모/형제/무관 판별) ───
+                # mo= 가 함께 있는 부모-클럽 링크는 "부모의 특정 섹션" 이므로
+                # breadcrumb 으로 간주해 거부하지 않는다.
+                if _reject_reason is None:
+                    m_cl_any = re.search(r"[?&]cl=([^&#]+)", url_lower)
+                    m_path_club = re.search(
+                        r"/plugin/ar\.club/([a-zA-Z0-9_]+)(?:/|\?|$)", url_lower,
+                    )
+                    link_cl = None
+                    if m_cl_any:
+                        link_cl = m_cl_any.group(1).strip().lower()
+                    elif m_path_club:
+                        link_cl = m_path_club.group(1).lower()
+
+                    if link_cl and link_cl != current_cl:
+                        common_len = 0
+                        for c1, c2 in zip(link_cl, current_cl):
+                            if c1 == c2:
+                                common_len += 1
+                            else:
+                                break
+                        if common_len < 3:
+                            _reject_reason = (
+                                f"R-club unrelated (link_cl={link_cl}, "
+                                f"common={common_len})"
+                            )
+                        elif current_cl.startswith(link_cl) and not has_mo:
+                            _reject_reason = (
+                                f"R-club parent breadcrumb (link_cl={link_cl})"
+                            )
+
+                    if (
+                        _reject_reason is None
+                        and "/plugin/ar.club/" in url_lower
+                        and "cl=" not in url_lower
+                        and not m_path_club
+                    ):
+                        _reject_reason = "R4 ar.club listing"
+
+                if _reject_reason is not None:
+                    _diag_lines.append(
+                        f"  REJECT [{_reject_reason}] url={url!r} text={m.name!r}"
+                    )
+                    continue
+            else:
+                # 클럽 아닌 일반 컨텍스트: 상위 섹션·카테고리 링크만 제외
+                if re.search(r"[?&]mo=", url_lower):
+                    if current_code and sub_code != current_code:
+                        continue
+                if re.search(r"[?&]clp=", url_lower):
+                    continue
+                # 메인 메뉴 코드와 일치하는 경우도 거부 (단, 현재가 아닐 때)
+                if sub_code and sub_code in main_menu_codes and sub_code != current_code:
+                    continue
+
+            original_text = m.display_text
+            text = original_text
 
             # 상위 메뉴명 접두사 제거
             if clean_menu and text.startswith(clean_menu):
@@ -870,11 +1019,20 @@ class MainFrame(wx.Frame):
 
             # 카테고리 헤더 / 노이즈 제거
             if text.lower() in {h.lower() for h in header_noise}:
+                _diag_lines.append(
+                    f"  REJECT [header_noise] url={url!r} text={original_text!r}"
+                )
                 continue
             if not text or len(text) < 2:
+                _diag_lines.append(
+                    f"  REJECT [text_too_short] url={url!r} text={original_text!r}"
+                )
                 continue
             # 중복 제거
             if text.lower() in seen_texts:
+                _diag_lines.append(
+                    f"  REJECT [duplicate_text] url={url!r} text={original_text!r}"
+                )
                 continue
             seen_texts.add(text.lower())
 
@@ -886,11 +1044,23 @@ class MainFrame(wx.Frame):
             else:
                 display_items.append(f"{num}. {text}")
             filtered_subs.append(m)
+            _diag_lines.append(
+                f"  KEEP    url={url!r} text={original_text!r} code={code!r}"
+            )
             num += 1
 
         # 필터링 후 실제 항목이 없으면 "게시물이 없습니다" 표시
         if not filtered_subs:
             display_items = ["0. 메인 메뉴로 돌아가기", "게시물이 없습니다."]
+
+        # 진단 로그 파일 저장
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(_diag_path, "w", encoding="utf-8") as _f:
+                _f.write("\n".join(_diag_lines))
+                _f.write(f"\n\n최종 표시 개수: {len(filtered_subs)}\n")
+        except Exception:
+            pass
 
         self.current_sub_menus = filtered_subs
         self._update_textctrl(display_items, f"{menu_name} 하위 메뉴")
@@ -915,7 +1085,11 @@ class MainFrame(wx.Frame):
     def _show_post_dialog(self, content: PostContent):
         """게시물 대화상자 표시. 이전/다음 게시물 이동도 처리."""
         while True:
-            dialog = PostDialog(self, content, self.session)
+            dialog = PostDialog(
+                self, content, self.session,
+                current_user_id=self.current_user_id,
+                current_user_nickname=self.current_user_nickname,
+            )
             result = dialog.ShowModal()
             nav = dialog.navigate_result
             dialog.Destroy()
@@ -1008,9 +1182,9 @@ class MainFrame(wx.Frame):
                 return
 
             # 2순위: 하위 메뉴
-            sub_menus = parse_sub_menus(html)
+            sub_menus = parse_sub_menus(html, base_url=board_url)
             if sub_menus:
-                self._show_sub_menu(sub_menus, name)
+                self._show_sub_menu(sub_menus, name, base_url=board_url)
                 return
 
             # 3순위: 본문
@@ -1061,7 +1235,7 @@ class MainFrame(wx.Frame):
                     fallback_menus.append(SubMenuItem(text, href))
 
             if fallback_menus:
-                self._show_sub_menu(fallback_menus, name)
+                self._show_sub_menu(fallback_menus, name, base_url=board_url)
                 return
 
             speak(f"{name}에 표시할 내용이 없습니다.")
@@ -1735,6 +1909,82 @@ class MainFrame(wx.Frame):
                 bo_table = bo_match2.group(1)
         return bo_table, wr_id
 
+    # ── 게시물 작성자 검증 ──
+
+    def _names_match(self, a: str | None, b: str | None) -> bool:
+        """닉네임 두 개가 같은 사람을 가리키는지 판단.
+        공백·대소문자·말미 존칭(님/씨) 을 정규화한 뒤 비교하고, 한쪽이 다른
+        쪽을 포함하는 경우("닉네임" ⊂ "닉네임 (아이디)") 도 일치로 본다."""
+        def norm(s: str | None) -> str:
+            if not s:
+                return ""
+            s = re.sub(r"<[^>]+>", "", s).strip()
+            for suf in ("님의 정보", "님 정보", "님", "씨"):
+                if s.endswith(suf):
+                    s = s[: -len(suf)].strip()
+            s = re.sub(r"\s+", " ", s)
+            return s.lower()
+
+        na, nb = norm(a), norm(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        if na in nb or nb in na:
+            return True
+        return False
+
+    def _verify_post_ownership(self, bo_table: str, wr_id: str,
+                               hint_author_name: str = "") -> tuple[bool, str]:
+        """게시물 작성자와 현재 로그인한 사용자가 동일한지 확인한다.
+
+        서버는 동호회 관리자에게 모든 게시물의 수정/삭제 권한을 주지만, 이 앱은
+        "자기 글만 수정·삭제한다" 정책을 클라이언트에서 강제하기 위해 아래 순서로
+        판단한다:
+
+          1) 닉네임 비교 (가장 빠르고 안정적)
+             - self.current_user_nickname vs hint_author_name(게시물 목록의 닉네임)
+             - 일치 → 본인 / 불일치 → 타인
+          2) 게시물 본문 페이지에서 작성자 mb_id 추출 후 current_user_id 와 비교
+          3) 둘 다 판단 불가면 허용으로 폴백 (본인 글 막히는 것 방지)
+             — 이 경로는 서버의 기본 권한 체크가 계속 동작하므로 관리자 이외엔
+             의미가 없고, 관리자 계정에서만 드물게 false-negative 발생.
+
+        Returns:
+            (True,  ""):  본인 게시물 → 진행 허용
+            (False, msg): 타인 게시물 → 진행 거부 (msg 는 안내용)
+        """
+        if not self.current_user_id:
+            return False, "로그인 사용자 정보를 확인할 수 없어 수정·삭제를 중단합니다."
+
+        # 1) 닉네임 비교 (HTTP 호출 없음)
+        if self.current_user_nickname and hint_author_name:
+            if self._names_match(self.current_user_nickname, hint_author_name):
+                return True, ""
+            return False, "본인이 작성한 게시물만 수정·삭제할 수 있습니다."
+
+        # 2) 게시물 본문 페이지에서 mb_id 추출
+        try:
+            post_url = (
+                f"{SORISEM_BASE_URL}/bbs/board.php?"
+                f"bo_table={bo_table}&wr_id={wr_id}"
+            )
+            resp = self.session.get(post_url, timeout=15)
+        except Exception as e:
+            # 네트워크 에러: 진행 허용 (본인 글 막힘 방지). 서버가 최종 권한 검사.
+            return True, ""
+
+        from page_parser import extract_post_author_id
+        author_id = extract_post_author_id(resp.text)
+
+        if author_id:
+            if author_id.strip().lower() == self.current_user_id.strip().lower():
+                return True, ""
+            return False, "본인이 작성한 게시물만 수정·삭제할 수 있습니다."
+
+        # 3) 판단 불가 — 서버 기본 권한 체크에 맡긴다.
+        return True, ""
+
     # ── 게시물 수정 ──
 
     def _edit_post(self):
@@ -1752,6 +2002,16 @@ class MainFrame(wx.Frame):
 
         if not bo_table or not wr_id:
             speak("이 게시물은 수정할 수 없습니다.")
+            return
+
+        # 클라이언트측 작성자 검증: 서버가 관리자에게 허용하더라도 본인 글만
+        # 수정할 수 있게 일관된 정책을 강제.
+        owned, own_msg = self._verify_post_ownership(
+            bo_table, wr_id, hint_author_name=getattr(post, "author", ""),
+        )
+        if not owned:
+            speak(own_msg)
+            wx.MessageBox(own_msg, "수정 불가", wx.OK | wx.ICON_WARNING, self)
             return
 
         # 수정 페이지 URL 생성
@@ -1818,6 +2078,16 @@ class MainFrame(wx.Frame):
 
         if not bo_table or not wr_id:
             speak("이 게시물은 삭제할 수 없습니다.")
+            return
+
+        # 클라이언트측 작성자 검증 — 확인 대화상자를 띄우기 전에 먼저 검사해야
+        # "확인 → 본인 글 아님" 순서의 어색한 흐름을 피할 수 있다.
+        owned, own_msg = self._verify_post_ownership(
+            bo_table, wr_id, hint_author_name=getattr(post, "author", ""),
+        )
+        if not owned:
+            speak(own_msg)
+            wx.MessageBox(own_msg, "삭제 불가", wx.OK | wx.ICON_WARNING, self)
             return
 
         result = wx.MessageBox(
@@ -2121,19 +2391,19 @@ class MainFrame(wx.Frame):
             if not html or len(html) < 100:
                 return False
             posts = parse_board_list(html)
-            sub_menus = parse_sub_menus(html)
+            sub_menus = parse_sub_menus(html, base_url=tried_url)
             display_name = resolve_display_name(html, sub_menus)
             # 클럽 URL (ar.club 플러그인)이면 하위메뉴 우선
             is_club_url = "ar.club" in tried_url
             if is_club_url and sub_menus:
-                self._show_sub_menu(sub_menus, display_name)
+                self._show_sub_menu(sub_menus, display_name, base_url=tried_url)
                 return True
             if posts:
                 self.current_board_url = tried_url
                 self._show_post_list(posts, display_name, tried_url, 1)
                 return True
             if sub_menus:
-                self._show_sub_menu(sub_menus, display_name)
+                self._show_sub_menu(sub_menus, display_name, base_url=tried_url)
                 return True
             if "bo_table=" in tried_url and attempted_board:
                 self.current_board_url = tried_url
