@@ -7,6 +7,16 @@ from urllib.parse import urlparse
 from config import MENU_LIST_FILE, SORISEM_BASE_URL
 
 
+# 초록등대 동호회의 하위 클럽 카테고리로 유지해야 하는 고정 메뉴.
+# 자동 감지가 실패하거나 저장 파일에 빠져있어도 항상 포함되도록 보장한다.
+# URL 이 cl=green4 / cl=green6 이므로 extract_shortcut_code 가 자동으로
+# green4 / green6 를 바로가기 코드로 반환한다.
+FORCED_CLUB_MENUS: tuple[tuple[str, str], ...] = (
+    ("자료실", "/plugin/ar.club/?cl=green4"),
+    ("엔터테인먼트 자료실", "/plugin/ar.club/?cl=green6"),
+)
+
+
 def extract_shortcut_code(url: str) -> str:
     """URL에서 바로가기 코드(고유 식별자)를 추출한다.
 
@@ -107,12 +117,37 @@ class MenuManager:
         # 메인 메뉴에서 "nas" 타입 엔트리 제거 — 이제 메뉴바 '도구' 메뉴로 이동함
         before = len(self.menus)
         self.menus = [m for m in self.menus if m.type != "nas"]
-        if len(self.menus) != before:
+
+        # 자료실 / 엔터테인먼트 자료실을 강제로 보장 (빠져 있으면 추가, URL 보정)
+        changed = self._ensure_forced_club_menus()
+
+        if len(self.menus) != before or changed:
             try:
                 self.save()
             except Exception:
                 pass
         return self.menus
+
+    def _ensure_forced_club_menus(self) -> bool:
+        """자료실·엔터테인먼트 자료실이 항상 초록등대 클럽 URL 로 유지되도록 보장.
+
+        반환: 실제로 변경이 있었는지 여부.
+        """
+        changed = False
+        by_name = {m.name: m for m in self.menus}
+        for forced_name, forced_url in FORCED_CLUB_MENUS:
+            existing = by_name.get(forced_name)
+            if existing is None:
+                # 빠져 있다면 끝에 추가
+                self.menus.append(MenuItem(forced_name, forced_url, "club"))
+                changed = True
+            else:
+                # URL·타입이 다르면 보정
+                if existing.url != forced_url or existing.type != "club":
+                    existing.url = forced_url
+                    existing.type = "club"
+                    changed = True
+        return changed
 
     def save(self) -> None:
         data = {

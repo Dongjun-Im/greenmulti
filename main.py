@@ -47,7 +47,7 @@ class ChorokMultiApp(wx.App):
         try:
             from green_auth import speak
             from config import SORISEM_BASE_URL
-            from menu_manager import MenuManager, MenuItem
+            from menu_manager import MenuManager, MenuItem, FORCED_CLUB_MENUS
             from bs4 import BeautifulSoup
             import re
 
@@ -100,6 +100,23 @@ class ChorokMultiApp(wx.App):
                     menu_type = "category"
 
                 menus.append(MenuItem(text, href, menu_type))
+
+            # ── 자료실 / 엔터테인먼트 자료실 보장 및 URL 보정 ──
+            # 소리샘 사이트 구조 변화나 일시적 감지 실패로 이 두 메뉴가 빠지는
+            # 일이 있어 사용자 메인 메뉴에서 사라지는 문제가 보고됐다. 이름이
+            # 맞는 항목이 있으면 URL 을 초록등대 동호회의 하위 클럽 URL 로
+            # 고정하고, 아예 없으면 끝에 덧붙인다. 이렇게 하면 바로가기 코드도
+            # 자동으로 green4 / green6 으로 표시된다.
+            names_in_menus = {m.name: m for m in menus}
+            for forced_name, forced_url in FORCED_CLUB_MENUS:
+                existing = names_in_menus.get(forced_name)
+                if existing is not None:
+                    # URL·타입만 보정. 감지된 위치(순서)는 유지.
+                    existing.url = forced_url
+                    existing.type = "club"
+                else:
+                    # 감지 실패 시 끝에 고정 항목 추가
+                    menus.append(MenuItem(forced_name, forced_url, "club"))
 
             if len(menus) > 1:
                 manager = MenuManager()
