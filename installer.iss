@@ -2,7 +2,7 @@
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.6.3"
+#define AppVersion "1.6.4"
 #define AppVersionDisplay "v1.6"
 #define AppPublisher "초록등대 동호회"
 #define AppExeName "초록멀티 v1.6.exe"
@@ -27,7 +27,7 @@ OutputDir=installer_out
 ; 빌드 시에는 ASCII 안전한 이름으로 저장하고, 워크플로의 후속 단계에서
 ; Python 으로 한글 접두사를 붙여 리네임한다 (Windows runner 의 PowerShell·
 ; ISCC 인코딩 처리에서 한글이 잘려 나가는 문제를 우회).
-OutputBaseFilename=chorokmulti_v1.6_setup
+OutputBaseFilename=greenmulti_v1.6_setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

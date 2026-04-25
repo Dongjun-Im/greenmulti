@@ -74,7 +74,7 @@ jobs:
           # 압축 안의 폴더는 그대로 한글이라 사용자가 풀면 "초록멀티 v1.6/" 폴더가 생긴다.
           $dist = Get-ChildItem "dist" -Directory | Select-Object -First 1 -ExpandProperty FullName
           $name = Split-Path $dist -Leaf
-          $zip = "$env:GITHUB_WORKSPACE/installer_out/chorokmulti_v${{ steps.vars.outputs.version }}.zip"
+          $zip = "$env:GITHUB_WORKSPACE/installer_out/greenmulti_v${{ steps.vars.outputs.version }}.zip"
           New-Item -ItemType Directory -Force -Path "installer_out" | Out-Null
           Push-Location (Split-Path $dist -Parent)
           Compress-Archive -Path $name -DestinationPath $zip -Force
