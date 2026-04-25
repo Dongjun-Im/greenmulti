@@ -118,7 +118,10 @@ jobs:
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: 초록멀티 ${{ steps.vars.outputs.tag }}
-          generate_release_notes: true
+          # RELEASE_NOTES.md 가 있으면 그 내용을 릴리스 본문으로 사용.
+          # 없으면 자동 생성된 노트(커밋·PR 요약)로 폴백.
+          body_path: ${{ hashFiles('RELEASE_NOTES.md') != '' && 'RELEASE_NOTES.md' || '' }}
+          generate_release_notes: ${{ hashFiles('RELEASE_NOTES.md') == '' }}
           draft: false
           # 태그 이름에 하이픈이 있으면(예: v1.6.0-beta.1) 프리릴리스, 아니면 정식 릴리스.
           prerelease: ${{ contains(github.ref_name, '-') }}
