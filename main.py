@@ -15,6 +15,21 @@ class ChorokMultiApp(wx.App):
         self.session = None
         self.user_id: str | None = None
         self.user_nickname: str | None = None
+
+        # 단일 인스턴스 체크 — 같은 프로그램이 이미 실행 중이면 안내 후 종료.
+        # 사용자 프로필마다 별도 파일을 쓰도록 이름에 사용자명을 포함.
+        self._instance_checker = wx.SingleInstanceChecker(
+            f"chorok_multi_{wx.GetUserId()}"
+        )
+        if self._instance_checker.IsAnotherRunning():
+            wx.MessageBox(
+                "초록멀티가 이미 실행 중입니다.\n"
+                "작업 표시줄이나 알림 영역에서 실행 중인 창을 확인해 주세요.",
+                "초록멀티 실행 중",
+                wx.OK | wx.ICON_INFORMATION,
+            )
+            return False
+
         self._play_startup_sound()
         self._cleanup_old_update_artifacts()
 
@@ -43,13 +58,23 @@ class ChorokMultiApp(wx.App):
         return 0
 
     def _auto_detect_menus(self):
-        """로그인 후 소리샘 메인 페이지에서 실제 메뉴 URL을 자동 감지"""
+        """로그인 후 소리샘 메인 페이지에서 실제 메뉴 URL을 자동 감지.
+
+        사용자가 data/menu_list.txt 를 편집해 두었다면 자동 감지를 건너뛰고
+        해당 파일을 그대로 사용한다.
+        """
         try:
             from green_auth import speak
             from config import SORISEM_BASE_URL
-            from menu_manager import MenuManager, MenuItem, FORCED_CLUB_MENUS
+            from menu_manager import MenuManager, MenuItem
             from bs4 import BeautifulSoup
             import re
+
+            # 사용자 편집 파일이 있으면 자동 감지 건너뛰기
+            _probe_manager = MenuManager()
+            if _probe_manager.has_user_override():
+                speak("사용자 메뉴 파일을 사용합니다.")
+                return
 
             speak("메뉴를 불러오는 중입니다.")
             resp = self.session.get(SORISEM_BASE_URL, timeout=15)
@@ -101,27 +126,37 @@ class ChorokMultiApp(wx.App):
 
                 menus.append(MenuItem(text, href, menu_type))
 
-            # ── 자료실 / 엔터테인먼트 자료실 보장 및 URL 보정 ──
-            # 소리샘 사이트 구조 변화나 일시적 감지 실패로 이 두 메뉴가 빠지는
-            # 일이 있어 사용자 메인 메뉴에서 사라지는 문제가 보고됐다. 이름이
-            # 맞는 항목이 있으면 URL 을 초록등대 동호회의 하위 클럽 URL 로
-            # 고정하고, 아예 없으면 끝에 덧붙인다. 이렇게 하면 바로가기 코드도
-            # 자동으로 green4 / green6 으로 표시된다.
-            names_in_menus = {m.name: m for m in menus}
-            for forced_name, forced_url in FORCED_CLUB_MENUS:
-                existing = names_in_menus.get(forced_name)
-                if existing is not None:
-                    # URL·타입만 보정. 감지된 위치(순서)는 유지.
-                    existing.url = forced_url
-                    existing.type = "club"
-                else:
-                    # 감지 실패 시 끝에 고정 항목 추가
-                    menus.append(MenuItem(forced_name, forced_url, "club"))
+            # ── 메인 메뉴 정돈 ──
+            # 1) 이전 버전에서 메인 메뉴에 잘못 추가된 초록등대 클럽 자료실
+            #    (cl=green4) / 엔터테인먼트 자료실 (cl=green6) 엔트리를 제거.
+            #    이 두 메뉴는 초록등대 동호회 하위 메뉴에만 존재하도록 한다.
+            _stale_urls = {
+                "/plugin/ar.club/?cl=green4",
+                "/plugin/ar.club/?cl=green6",
+            }
+            menus = [m for m in menus if m.url not in _stale_urls]
+
+            # 2) 소리샘 자료실 이름 보정: "자료실"(번호 접두사 허용) 을
+            #    "소리샘 자료실" 로 표시해 메인 메뉴에서 어떤 자료실인지
+            #    명확하게 드러낸다. URL에 mo=pds 가 포함된 항목이 대상.
+            for m in menus:
+                if "mo=pds" not in m.url:
+                    continue
+                m_num = re.match(r'^(\s*\d+[\.\)]\s*)', m.name or "")
+                _prefix = m_num.group(1) if m_num else ""
+                _core = (m.name or "")[len(_prefix):].strip()
+                if _core == "자료실":
+                    m.name = f"{_prefix}소리샘 자료실"
 
             if len(menus) > 1:
                 manager = MenuManager()
                 manager.menus = menus
                 manager.save()
+                # 사용자 편집용 텍스트 파일 seed. 이미 있으면 덮어쓰지 않음.
+                try:
+                    manager.export_to_txt()
+                except Exception:
+                    pass
                 speak(f"{len(menus)}개 메뉴를 불러왔습니다.")
             else:
                 speak("메뉴를 불러오지 못했습니다. 기존 메뉴를 사용합니다.")

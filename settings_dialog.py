@@ -270,8 +270,12 @@ CATEGORIES: list[tuple[str, str]] = [
 
 
 # 알림 주기 옵션
+# interval_sec 이 양수면 해당 초 간격으로, 1(특수값)이면 "즉시" — 최소 간격으로 폴링.
+NOTIFY_INTERVAL_IMMEDIATE_SEC = 1  # "즉시" 선택지에 대응하는 폴링 간격(초)
 NOTIFY_INTERVAL_OPTIONS: list[tuple[int, str]] = [
     (0, "끄기"),
+    (NOTIFY_INTERVAL_IMMEDIATE_SEC, "즉시"),
+    (10, "10초"),
     (30, "30초"),
     (60, "1분"),
     (180, "3분"),
@@ -287,7 +291,7 @@ def load_notify_settings() -> dict:
     import json
     from config import MEMO_NOTIFY_SETTINGS_FILE
     defaults = {
-        "interval_sec": 60,
+        "interval_sec": NOTIFY_INTERVAL_IMMEDIATE_SEC,
         "check_memo": True,
         "check_mail": True,
         "list_page_size": 10,
@@ -298,7 +302,9 @@ def load_notify_settings() -> dict:
         with open(MEMO_NOTIFY_SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            defaults["interval_sec"] = int(data.get("interval_sec", 60))
+            defaults["interval_sec"] = int(
+                data.get("interval_sec", NOTIFY_INTERVAL_IMMEDIATE_SEC)
+            )
             defaults["check_memo"] = bool(data.get("check_memo", True))
             defaults["check_mail"] = bool(data.get("check_mail", True))
             size = int(data.get("list_page_size", 10))
@@ -317,7 +323,9 @@ def save_notify_settings(settings: dict) -> None:
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         cleaned = {
-            "interval_sec": int(settings.get("interval_sec", 60)),
+            "interval_sec": int(
+                settings.get("interval_sec", NOTIFY_INTERVAL_IMMEDIATE_SEC)
+            ),
             "check_memo": bool(settings.get("check_memo", True)),
             "check_mail": bool(settings.get("check_mail", True)),
             "list_page_size": int(settings.get("list_page_size", 10)),
@@ -352,11 +360,11 @@ class NotifyPage(wx.Panel):
             choices=labels,
             majorDimension=1, style=wx.RA_SPECIFY_COLS,
         )
-        cur = int(self.settings.get("interval_sec", 60))
+        cur = int(self.settings.get("interval_sec", NOTIFY_INTERVAL_IMMEDIATE_SEC))
         try:
             cur_idx = self._interval_values.index(cur)
         except ValueError:
-            cur_idx = self._interval_values.index(60)
+            cur_idx = self._interval_values.index(NOTIFY_INTERVAL_IMMEDIATE_SEC)
         self.interval_rb.SetSelection(cur_idx)
         vbox.Add(self.interval_rb, 0, wx.ALL, 8)
 

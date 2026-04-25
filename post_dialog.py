@@ -16,10 +16,53 @@ from screen_reader import speak
 URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+')
 
 
-class ItemTextCtrl(wx.TextCtrl):
+class ContextMenuTextCtrl(wx.TextCtrl):
+    """팝업 키(application key)·Shift+F10 로 커스텀 팝업 메뉴가 뜨도록 하는 TextCtrl.
+
+    wx.TE_RICH2 스타일의 TextCtrl 은 내부적으로 Windows RICHEDIT 네이티브
+    컨트롤을 쓰기 때문에, 키보드로 컨텍스트 메뉴를 호출하면 WM_CONTEXTMENU
+    가 컨트롤 레벨에서 자체 편집 메뉴(잘라내기/복사/붙여넣기)를 띄우고
+    wx.EVT_CONTEXT_MENU 이벤트를 발사하지 않는다.
+
+    해결 방법: 키 입력(EVT_KEY_DOWN)에서 VK_APPS(메뉴 키)와 Shift+F10 을
+    직접 감지해, 바깥에서 `bind_context_menu(handler)` 로 등록한 핸들러를
+    호출한다. 마우스 오른쪽 클릭은 기존 EVT_CONTEXT_MENU 로 같은 핸들러를
+    받도록 래퍼를 함께 바인딩한다.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ctx_menu_handler = None
+        self.Bind(wx.EVT_KEY_DOWN, self._on_ctx_key_down)
+        self.Bind(wx.EVT_CONTEXT_MENU, self._on_ctx_mouse)
+
+    def bind_context_menu(self, handler):
+        """팝업 키/우클릭에서 호출할 커스텀 메뉴 표시 함수 등록."""
+        self._ctx_menu_handler = handler
+
+    def _on_ctx_mouse(self, event):
+        if self._ctx_menu_handler:
+            self._ctx_menu_handler(event)
+            return
+        event.Skip()
+
+    def _on_ctx_key_down(self, event):
+        k = event.GetKeyCode()
+        # VK_APPS(팝업 키) = WXK_WINDOWS_MENU, 또는 Shift+F10
+        if k == wx.WXK_WINDOWS_MENU or (k == wx.WXK_F10 and event.ShiftDown()):
+            if self._ctx_menu_handler:
+                self._ctx_menu_handler(event)
+                return
+        event.Skip()
+
+
+class ItemTextCtrl(ContextMenuTextCtrl):
     """특정 키를 네이티브 레벨에서 차단하는 TextCtrl.
     댓글 목록처럼 한 줄만 표시하면서 좌/우·Ctrl+좌/우로 글자/단어 단위
-    기본 낭독을 받기 위해 사용."""
+    기본 낭독을 받기 위해 사용.
+
+    ContextMenuTextCtrl 를 상속해 팝업 키에서도 커스텀 컨텍스트 메뉴가 뜬다.
+    """
 
     def MSWHandleMessage(self, msg, wParam, lParam):
         WM_KEYDOWN = 0x0100
@@ -95,6 +138,17 @@ class CommentDialog(wx.Dialog):
         self.comment_text.SetFocus()
         self.Centre()
 
+        # Ctrl+Enter 로 확인 — 일반 Enter 는 TE_MULTILINE 에서 줄바꿈으로 쓰인다.
+        # 다른 모든 키는 event.Skip() 으로 흘려 정상 입력되도록 한다.
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+
+    def _on_char_hook(self, event):
+        if event.GetKeyCode() == wx.WXK_RETURN and event.ControlDown():
+            if self.IsModal():
+                self.EndModal(wx.ID_OK)
+            return
+        event.Skip()
+
     def get_text(self) -> str:
         return self.comment_text.GetValue().strip()
 
@@ -138,6 +192,13 @@ class PostDialog(wx.Dialog):
         # 키보드 이벤트
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
 
+        # 상황별 팝업 메뉴 — 본문/댓글에서 오른쪽 클릭 또는 메뉴 키(팝업 키)/
+        # Shift+F10 으로 호출. ContextMenuTextCtrl.bind_context_menu 는 마우스
+        # 이벤트와 키보드 이벤트 모두 같은 핸들러로 라우팅한다.
+        self.body_text.bind_context_menu(self._on_body_context_menu)
+        if self.has_comments:
+            self.comment_ctrl.bind_context_menu(self._on_comment_context_menu)
+
         # 저시력 테마 적용
         try:
             from theme import apply_theme, make_font, load_font_size
@@ -174,7 +235,7 @@ class PostDialog(wx.Dialog):
 
         # 본문
         self.body_label = wx.StaticText(self.panel, label="본문:")
-        self.body_text = wx.TextCtrl(
+        self.body_text = ContextMenuTextCtrl(
             self.panel,
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
             name="본문",
@@ -337,6 +398,15 @@ class PostDialog(wx.Dialog):
         alt = event.AltDown()
         ctrl = event.ControlDown()
 
+        # 자식 모달 대화상자(CommentDialog 등)가 열려 있을 때는 이 핸들러의
+        # 단축키(Alt+M, Alt+D, Ctrl+U, Alt+R, Alt+B, Alt+N 등)가 자식의 입력을
+        # 가로채서 "마침표 → M/B/…" 같은 엉뚱한 입력 증상을 만들 수 있다.
+        # 포커스가 이 대화상자 내부에 없으면 모든 단축키 처리를 건너뛰고
+        # 이벤트를 그대로 흘려보낸다.
+        if focused is not None and not self.IsDescendant(focused):
+            event.Skip()
+            return
+
         # Enter: 커서 위치의 URL을 브라우저에서 열기 (본문 영역에서만)
         if keycode == wx.WXK_RETURN and not alt and not ctrl:
             if focused == self.body_text:
@@ -438,18 +508,134 @@ class PostDialog(wx.Dialog):
 
         event.Skip()
 
+    # ── 상황별 팝업 메뉴 ──
+
+    def _on_body_context_menu(self, event):
+        """본문 영역 팝업 메뉴 — 게시물/본문 관련 액션 모음.
+
+        이전/다음 게시물, 글자 이동 같은 내비게이션 항목은 제외.
+        """
+        menu = wx.Menu()
+
+        id_save_body = wx.NewIdRef()
+        menu.Append(id_save_body, "본문 텍스트 저장(&B)\tB")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_save_body(), id=id_save_body)
+
+        if self.has_files:
+            id_save_file = wx.NewIdRef()
+            menu.Append(id_save_file, "첨부파일 저장(&S)\tAlt+S")
+            self.Bind(wx.EVT_MENU, lambda e: self.on_download_file(None), id=id_save_file)
+
+        id_url_list = wx.NewIdRef()
+        menu.Append(id_url_list, "URL 목록 보기(&U)\tCtrl+U")
+        self.Bind(wx.EVT_MENU, lambda e: self._show_url_list(), id=id_url_list)
+
+        menu.AppendSeparator()
+
+        id_write_comment = wx.NewIdRef()
+        menu.Append(id_write_comment, "댓글 작성(&C)\tC")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_write_comment(), id=id_write_comment)
+
+        menu.AppendSeparator()
+
+        if self.content.edit_url:
+            id_edit = wx.NewIdRef()
+            menu.Append(id_edit, "게시물 수정(&M)\tAlt+M")
+            self.Bind(wx.EVT_MENU, lambda e: self.on_post_edit(None), id=id_edit)
+        if self.content.delete_url:
+            id_del = wx.NewIdRef()
+            menu.Append(id_del, "게시물 삭제(&D)\tAlt+D")
+            self.Bind(wx.EVT_MENU, lambda e: self.on_post_delete(None), id=id_del)
+        if self.content.reply_url:
+            id_reply = wx.NewIdRef()
+            menu.Append(id_reply, "게시물 답변(&R)\tAlt+R")
+            self.Bind(wx.EVT_MENU, lambda e: self.on_post_reply(None), id=id_reply)
+
+        # 이전/다음 게시물 이동 — 팝업에서도 바로 이동할 수 있도록.
+        if self.content.prev_url or self.content.next_url:
+            menu.AppendSeparator()
+            if self.content.prev_url:
+                id_prev = wx.NewIdRef()
+                menu.Append(id_prev, "이전 게시물(&B)\tAlt+B")
+                self.Bind(wx.EVT_MENU, lambda e: self._goto_prev_post(), id=id_prev)
+            if self.content.next_url:
+                id_next = wx.NewIdRef()
+                menu.Append(id_next, "다음 게시물(&N)\tAlt+N")
+                self.Bind(wx.EVT_MENU, lambda e: self._goto_next_post(), id=id_next)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _goto_prev_post(self):
+        if self.content.prev_url:
+            self.navigate_result = "prev"
+            self.EndModal(wx.ID_BACKWARD)
+
+    def _goto_next_post(self):
+        if self.content.next_url:
+            self.navigate_result = "next"
+            self.EndModal(wx.ID_FORWARD)
+
+    def _on_comment_context_menu(self, event):
+        """댓글 목록 팝업 메뉴 — 댓글 관련 액션 모음.
+
+        댓글 이동(위/아래/처음/끝)은 내비게이션이라 제외.
+        """
+        menu = wx.Menu()
+
+        id_write = wx.NewIdRef()
+        menu.Append(id_write, "댓글 작성(&C)\tC")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_write_comment(), id=id_write)
+
+        id_edit = wx.NewIdRef()
+        menu.Append(id_edit, "댓글 수정(&M)\tM")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_edit_comment(), id=id_edit)
+
+        id_del = wx.NewIdRef()
+        menu.Append(id_del, "댓글 삭제(&D)\tAlt+D")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_delete_comment(), id=id_del)
+
+        menu.AppendSeparator()
+
+        id_sort = wx.NewIdRef()
+        label = "댓글 최신순 보기(&N)" if not self.comment_reversed else "댓글 오래된순 보기(&N)"
+        menu.Append(id_sort, f"{label}\tN")
+        self.Bind(wx.EVT_MENU, lambda e: self.on_toggle_comment_sort(), id=id_sort)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
+
     # ── 댓글 목록 이동 ──
 
     def _jump_to_comment(self, new_index: int):
-        """댓글 목록에서 다른 댓글로 이동. SetValue 호출로 스크린리더가 자동 낭독."""
+        """댓글 목록에서 다른 댓글로 이동.
+
+        댓글 본문이 여러 줄일 수 있어, SetValue 후 커서 위치 0 기준으로는
+        스크린리더가 첫 글자만 읽는 문제가 있다. 메인 메뉴의 Home/End 와
+        동일한 "비움 → speak → 복원" 패턴으로 전체 내용을 한 번에 낭독.
+        Up/Down 에도 같은 방식을 적용해 일관된 낭독이 되도록 한다.
+        """
         if not self._comment_displays:
             return
         n = len(self._comment_displays)
         new_index = max(0, min(new_index, n - 1))
         self._comment_index = new_index
-        self.comment_ctrl.SetValue(self._comment_displays[new_index])
-        self.comment_ctrl.SetInsertionPoint(0)
+        display = self._comment_displays[new_index]
+        # 1) TextCtrl 을 비워 스크린리더가 커서 위치 글자를 읽지 않게 함
+        self.comment_ctrl.ChangeValue("")
+        # 2) 전체 텍스트를 직접 낭독
+        speak(display)
+        # 3) 스크린리더의 키 처리가 끝난 뒤 화면 표시 복원
+        wx.CallLater(80, self._restore_comment_display, display)
         self._update_comment_buttons()
+
+    def _restore_comment_display(self, display: str):
+        """_jump_to_comment 에서 비웠던 댓글 내용을 화면에 다시 표시.
+
+        ChangeValue 를 써서 스크린리더 재낭독을 유발하지 않는다.
+        """
+        self.comment_ctrl.ChangeValue(display)
+        self.comment_ctrl.SetInsertionPoint(0)
 
     def _update_comment_buttons(self):
         """현재 선택된 댓글의 수정/삭제 버튼 활성 상태 갱신."""
@@ -510,26 +696,30 @@ class PostDialog(wx.Dialog):
                         break
 
             if body:
-                raw = f"{header} : {body}" if header else body
+                # 머리말(작성자·날짜)과 본문은 줄바꿈으로 구분해, 본문의 줄바꿈이
+                # 그대로 보존되도록 한다. comment_ctrl은 TE_MULTILINE 이므로
+                # 화면에도 여러 줄로 표시된다.
+                raw = f"{header}\n{body}" if header else body
             elif header:
                 raw = header
             else:
                 raw = "(빈 댓글)"
-            # TextCtrl에 표시하므로 줄바꿈/탭은 공백으로 치환 (글자 낭독 시 잡음 방지)
-            raw = raw.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-            raw = raw.replace("\t", " ")
+            # 줄바꿈 정규화만 수행 (탭은 공백으로). 본문의 \n 은 보존해서 다줄 표시.
+            raw = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
             display.append(raw)
 
         total = len(display)
-        # 화면/스크린리더가 댓글 내용을 먼저 읽고, 위치 정보는 뒤에 읽도록 suffix.
-        # 좌/우 글자 이동 시작점도 댓글 본문 첫 글자가 되어 낭독이 자연스럽다.
-        display_with_index = [f"{text} ({i + 1}/{total})" for i, text in enumerate(display)]
+        # 위치 정보는 마지막 줄에 별도 표시 — 본문 글자 낭독을 방해하지 않도록.
+        display_with_index = [f"{text}\n({i + 1}/{total})" for i, text in enumerate(display)]
 
         self._comment_displays = display_with_index
         if display_with_index:
             # 현재 인덱스를 범위 내로 보정 (정렬 토글 후에도 동일 위치 유지)
             self._comment_index = min(self._comment_index, len(display_with_index) - 1)
-            self.comment_ctrl.ChangeValue(display_with_index[self._comment_index])
+            # SetValue 로 설정해 포커스가 comment_ctrl 에 들어왔을 때 스크린리더가
+            # 내용을 인식하도록 한다. (ChangeValue 는 EVT_TEXT 를 발사하지 않아
+            # 스크린리더가 변경을 놓칠 수 있음.)
+            self.comment_ctrl.SetValue(display_with_index[self._comment_index])
             self.comment_ctrl.SetInsertionPoint(0)
             self._update_comment_buttons()
         else:

@@ -294,18 +294,25 @@ class MainFrame(wx.Frame):
         if self.current_items:
             speak(f"{APP_NAME}. {self.current_items[0]} 1/{len(self.current_items)}")
 
-        # UI가 뜬 뒤 NAS 자동 마운트 시도 (저장된 자격증명이 있을 때만, 백그라운드)
-        wx.CallLater(500, self._try_auto_mount_nas)
+        # 쪽지·메일 실시간 알림 폴링 먼저 시작 — 프로그램이 열리자마자 바로
+        # 감지를 시작해야 한다. NAS 자동 연결보다 **앞에** 두어야 NAS 연결
+        # 과정(또는 그 과정에서 뜰 수 있는 대화상자)이 메일/쪽지 첫 tick 을
+        # 지연시키지 않는다.
+        self._unread_memo_count = 0
+        self._unread_mail_count = 0
+        self._base_title = APP_NAME
+        # 시작 시 제목 표시줄을 깨끗한 상태로 — 알림 첫 tick 결과로 갱신됨.
+        self.SetTitle(self._base_title)
+        wx.CallAfter(self._start_memo_notifier)
+
+        # 알림 폴링이 자리잡은 뒤에 NAS 자동 마운트 시도 (저장된 자격증명이
+        # 있을 때만, 백그라운드). 2초 정도 뒤에 시작하면 첫 알림 tick 이
+        # 안전하게 먼저 돌고 사용자가 미확인 알림을 받을 수 있다.
+        wx.CallLater(2000, self._try_auto_mount_nas)
 
         # 시작 시 자동 업데이트 확인 (설정에서 끌 수 있음). 로그인/메뉴 음성이
         # 먼저 끝나도록 몇 초 지연 후 백그라운드로 실행.
         wx.CallLater(3000, self._auto_update_check)
-
-        # 쪽지 실시간 알림 폴링 시작 (1분 간격)
-        self._unread_memo_count = 0
-        self._unread_mail_count = 0
-        self._base_title = APP_NAME
-        wx.CallLater(5000, self._start_memo_notifier)
 
     def _try_auto_mount_nas(self):
         """저장된 NAS 자격증명이 있으면 백그라운드로 rclone 마운트 시도."""
@@ -347,12 +354,13 @@ class MainFrame(wx.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _notify_nas_connected(self):
-        """연결 성공 시 음성 안내 + 정보 팝업."""
+        """연결 성공 시 음성 안내만. 팝업은 띄우지 않는다.
+
+        모달 팝업은 wx.Timer 기반 쪽지·메일 실시간 알림 tick 을 지연시키므로,
+        자동 연결 성공 안내는 TTS 로만 전달하고 사용자가 계속 알림을 받을 수
+        있도록 한다.
+        """
         speak("초록등대 자료실에 연결되었습니다.")
-        wx.MessageBox(
-            "초록등대 자료실에 연결되었습니다.",
-            "연결 완료", wx.OK | wx.ICON_INFORMATION, self,
-        )
 
     def _prompt_winfsp_install(self, download_url: str):
         """WinFSP 미설치 안내. 링크를 브라우저로 열어 줌."""
@@ -428,6 +436,13 @@ class MainFrame(wx.Frame):
         settings_menu.Append(self.id_settings, "설정(&T)\tF7")
         settings_menu.AppendSeparator()
         settings_menu.Append(self.id_download_dir, "다운로드 폴더 변경(&D)")
+        self.id_edit_menu_file = wx.NewIdRef()
+        self.id_reload_menu_file = wx.NewIdRef()
+        self.id_reset_menu_file = wx.NewIdRef()
+        settings_menu.AppendSeparator()
+        settings_menu.Append(self.id_edit_menu_file, "메뉴 목록 파일 편집(&M)")
+        settings_menu.Append(self.id_reload_menu_file, "메뉴 목록 파일 다시 읽기(&R)")
+        settings_menu.Append(self.id_reset_menu_file, "메뉴 목록 자동 감지로 초기화(&I)")
         menubar.Append(settings_menu, "설정(&S)")
 
         # 도구 메뉴
@@ -489,6 +504,9 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_open_memo_compose, id=self.id_memo_compose)
         self.Bind(wx.EVT_MENU, self.on_open_mail_compose, id=self.id_mail_compose)
         self.Bind(wx.EVT_MENU, self.on_memo_check_now, id=self.id_memo_check_now)
+        self.Bind(wx.EVT_MENU, self.on_edit_menu_file, id=self.id_edit_menu_file)
+        self.Bind(wx.EVT_MENU, self.on_reload_menu_file, id=self.id_reload_menu_file)
+        self.Bind(wx.EVT_MENU, self.on_reset_menu_file, id=self.id_reset_menu_file)
 
     def _build_status_bar(self):
         self.status_bar = self.CreateStatusBar(2)
@@ -518,6 +536,29 @@ class MainFrame(wx.Frame):
 
         self.textctrl.SetInsertionPoint(0)
         self.textctrl.SetFocus()
+
+        # 상황별 팝업(컨텍스트) 메뉴 — 오른쪽 클릭 / Menu 키 / Shift+F10
+        self.textctrl.Bind(wx.EVT_CONTEXT_MENU, self._on_textctrl_context_menu)
+
+    def _on_textctrl_context_menu(self, event):
+        """현재 화면(current_view)에 맞는 액션만 모은 팝업 메뉴 표시.
+
+        이동/페이지 탐색 같은 기본 내비게이션 항목은 의도적으로 제외.
+        """
+        if self.current_view != VIEW_POST_LIST:
+            # 메인/하위 메뉴에서는 상황별 액션이 거의 없음 → 팝업 표시 안 함
+            return
+
+        menu = wx.Menu()
+        menu.Append(self.id_post_write, "게시물 작성(&W)\tW")
+        menu.Append(self.id_post_edit, "게시물 수정(&M)\tAlt+M")
+        menu.Append(self.id_post_delete, "게시물 삭제(&D)\tAlt+D")
+        menu.AppendSeparator()
+        menu.Append(self.id_search, "게시물 검색(&F)\tCtrl+F")
+        menu.Append(self.id_board_refresh, "게시판 새로고침(&R)\tF5")
+
+        self.PopupMenu(menu)
+        menu.Destroy()
 
     def _bind_accelerators(self):
         # 글꼴 확대/축소/원래대로 ID
@@ -824,6 +865,14 @@ class MainFrame(wx.Frame):
         self.current_page = 1
         self.navigation_stack.clear()
         self.SetTitle(APP_NAME)
+        # 메인 메뉴를 그릴 때마다 자료실·엔터테인먼트 자료실 보장 로직 재실행.
+        # 어떤 이유로든 목록에서 빠지거나 순서가 틀어진 경우를 화면 표시 직전에
+        # 복원한다.
+        try:
+            if self.menu_manager._ensure_forced_club_menus():
+                self.menu_manager.save()
+        except Exception:
+            pass
         menu_names = self.menu_manager.get_display_names()
         self._update_textctrl(menu_names, "메뉴 목록")
         self.status_bar.SetStatusText("준비", 0)
@@ -915,9 +964,21 @@ class MainFrame(wx.Frame):
             url = (m.url or "").strip()
             url_lower = url.lower()
 
+            # 초록등대 동호회 자료실/엔터테인먼트 자료실 링크는 초록등대 동호회
+            # 컨텍스트(cl=green)에서 하위 메뉴를 볼 때만 표시. 소리샘 자료실
+            # (mo=pds) 같은 다른 컨텍스트의 하위 메뉴에서는 엉뚱하게 끼어들지
+            # 않도록 제외.
+            if url in ("/plugin/ar.club/?cl=green4", "/plugin/ar.club/?cl=green6"):
+                if current_cl != "green":
+                    continue
+
             # 브레드크럼(경로 안내) 링크 제거: 메인 메뉴 URL과 동일한 항목
+            # 단, 자료실·엔터테인먼트 자료실은 초록등대 동호회 컨텍스트
+            # (cl=green)에서 하위 메뉴를 볼 때만 예외적으로 표시.
             if url in main_menu_urls:
-                continue
+                from menu_manager import _forced_shortcut_code
+                if not (current_cl == "green" and _forced_shortcut_code(m.name)):
+                    continue
 
             sub_code = (extract_shortcut_code(url) or "").strip().lower()
 
@@ -1002,8 +1063,12 @@ class MainFrame(wx.Frame):
                 if re.search(r"[?&]clp=", url_lower):
                     continue
                 # 메인 메뉴 코드와 일치하는 경우도 거부 (단, 현재가 아닐 때)
+                # 자료실·엔터테인먼트 자료실 예외는 초록등대 동호회 컨텍스트
+                # (cl=green)에서만 유효.
+                from menu_manager import _forced_shortcut_code
                 if sub_code and sub_code in main_menu_codes and sub_code != current_code:
-                    continue
+                    if not (current_cl == "green" and _forced_shortcut_code(m.name)):
+                        continue
 
             original_text = m.display_text
             text = original_text
@@ -1036,9 +1101,15 @@ class MainFrame(wx.Frame):
                 continue
             seen_texts.add(text.lower())
 
-            # 바로가기 코드 추출 (URL 기반)
-            from menu_manager import extract_shortcut_code
-            code = extract_shortcut_code(m.url)
+            # 바로가기 코드 — 이름이 "자료실"/"엔터테인먼트 자료실" 이고
+            # 현재 컨텍스트가 초록등대 동호회(cl=green)일 때만 강제로
+            # green4/green6 표시. 그 외에는 URL 기반.
+            from menu_manager import extract_shortcut_code, _forced_shortcut_code
+            forced = _forced_shortcut_code(text) if current_cl == "green" else ""
+            if forced:
+                code = forced
+            else:
+                code = extract_shortcut_code(m.url)
             if code:
                 display_items.append(f"{num}. {text} (바로가기 코드: {code})")
             else:
@@ -1795,6 +1866,7 @@ class MainFrame(wx.Frame):
             "view": VIEW_SUB_MENU,
             "sub_menus": self.current_sub_menus,
             "menu_name": self.current_menu_name,
+            "base_url": getattr(self, "current_sub_menu_url", "") or "",
             "selection": index,
         })
         self._load_and_show(sub.url, sub.name)
@@ -1845,7 +1917,10 @@ class MainFrame(wx.Frame):
             self._show_main_menu()
             self._move_to_line(sel)
         elif prev["view"] == VIEW_SUB_MENU:
-            self._show_sub_menu(prev["sub_menus"], prev["menu_name"])
+            self._show_sub_menu(
+                prev["sub_menus"], prev["menu_name"],
+                base_url=prev.get("base_url", ""),
+            )
             self._move_to_line(sel)
         elif prev["view"] == VIEW_POST_LIST:
             self.current_board_url = prev.get("board_url", "")
@@ -2564,6 +2639,79 @@ class MainFrame(wx.Frame):
             wx.MessageBox(f"다운로드 폴더가 변경되었습니다.\n{new_dir}",
                           "완료", wx.OK | wx.ICON_INFORMATION, self)
         dlg.Destroy()
+
+    # ── 사용자 편집 메뉴 파일 ──
+
+    def on_edit_menu_file(self, event):
+        """사용자 편집용 메뉴 텍스트 파일을 기본 편집기로 연다.
+
+        파일이 없으면 현재 메뉴 목록을 시드로 기록한 뒤 연다.
+        """
+        from config import MENU_LIST_TXT_FILE
+        try:
+            self.menu_manager.export_to_txt()
+        except Exception as e:
+            speak(f"메뉴 파일을 준비하지 못했습니다. {e}")
+            return
+
+        if not os.path.exists(MENU_LIST_TXT_FILE):
+            speak("메뉴 파일을 찾을 수 없습니다.")
+            return
+
+        try:
+            os.startfile(MENU_LIST_TXT_FILE)
+            speak("메뉴 목록 파일을 엽니다. 저장 후 다시 읽기 메뉴를 실행하세요.")
+        except OSError as e:
+            speak(f"파일을 열 수 없습니다. {e}")
+            wx.MessageBox(
+                f"파일을 열 수 없습니다.\n경로: {MENU_LIST_TXT_FILE}\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
+
+    def on_reload_menu_file(self, event):
+        """메뉴 파일을 다시 읽어 메인 메뉴에 반영."""
+        try:
+            self.menu_manager.load()
+            self._show_main_menu()
+            speak(f"메뉴를 다시 불러왔습니다. {len(self.menu_manager.menus)}개.")
+        except Exception as e:
+            speak(f"메뉴를 다시 불러오지 못했습니다. {e}")
+            wx.MessageBox(
+                f"메뉴를 다시 불러오지 못했습니다.\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
+
+    def on_reset_menu_file(self, event):
+        """사용자 편집 파일을 삭제하고 다음 실행부터 자동 감지 복원.
+
+        현재 세션은 기존 JSON 캐시를 그대로 사용한다.
+        """
+        from config import MENU_LIST_TXT_FILE
+        if not os.path.exists(MENU_LIST_TXT_FILE):
+            speak("사용자 메뉴 파일이 없습니다. 이미 자동 감지를 사용하고 있습니다.")
+            return
+
+        dlg = wx.MessageDialog(
+            self,
+            "사용자 메뉴 목록 파일을 삭제합니다.\n"
+            "다음 로그인부터는 소리샘 메인 페이지에서 메뉴를 자동으로 다시 가져옵니다.\n\n"
+            "계속할까요?",
+            "메뉴 목록 초기화",
+            wx.YES_NO | wx.ICON_QUESTION,
+        )
+        confirm = dlg.ShowModal()
+        dlg.Destroy()
+        if confirm != wx.ID_YES:
+            return
+        try:
+            os.remove(MENU_LIST_TXT_FILE)
+            speak("사용자 메뉴 파일을 삭제했습니다. 다음 실행부터 자동 감지됩니다.")
+        except OSError as e:
+            speak(f"파일을 삭제하지 못했습니다. {e}")
+            wx.MessageBox(
+                f"파일을 삭제하지 못했습니다.\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
 
     # ── 바탕화면 바로가기 ──
 
@@ -3720,9 +3868,13 @@ class MainFrame(wx.Frame):
             self._mail_notifier = None
             if check_mail:
                 self._mail_notifier = MailNotifier(self, self.session)
+                # 매 tick 마다 서버 기준 안 읽은 메일 수를 제목 표시줄에 반영.
+                self._mail_notifier.on_unread_count = self._set_mail_unread_count
                 self._mail_notifier.start_initial_fill()
             if check_memo:
                 self._memo_notifier = MemoNotifier(self, self.session, self._on_new_memo_or_mail)
+                # 매 tick 마다 서버 기준 안 읽은 쪽지 수를 제목 표시줄에 반영.
+                self._memo_notifier.on_unread_count = self._set_memo_unread_count
                 # tick 시 mail 도 함께 체크하도록 hook
                 self._memo_notifier._piggyback_mail = self._poll_mail_from_memo_tick
                 # MemoNotifier 의 _check_in_bg 마지막에 piggyback 호출 필요 — wrap 대신
@@ -3759,7 +3911,13 @@ class MainFrame(wx.Frame):
         self._on_new_memo(count, new_items)
 
     def _on_new_mail(self, new_items):
-        """새 메일 도착 — 알림 센터에 등록 + 사운드/TTS/대화상자."""
+        """새 메일 도착 — 알림 센터에 등록 + 사운드/TTS + 팝업.
+
+        사용자가 메일함·쪽지함 등 모달 대화상자를 이미 열고 작업 중이면 사운드·
+        TTS·팝업은 모두 생략한다. (사용자는 그 화면에서 이미 메일 목록을 보고
+        있으므로 별도 알림이 오히려 방해가 된다.) 알림 센터에는 그대로 추가되어
+        나중에 확인할 수 있다.
+        """
         count = len(new_items)
         if count == 0:
             return
@@ -3776,13 +3934,14 @@ class MainFrame(wx.Frame):
             center.add_many(to_add)
         except Exception:
             pass
+        # 모달 대화상자 사용 중이면 모든 알림(소리·TTS·팝업) 생략.
+        if self._is_modal_dialog_open():
+            return
         try:
             from sound import play_event
             play_event("memo_new")
         except Exception:
             pass
-        self._unread_mail_count += count
-        self._update_title_unread()
         sender = new_items[0].sender if new_items else "알 수 없음"
         if count == 1:
             speak(f"새 메일이 도착했습니다. 보낸 사람 {sender}")
@@ -3801,6 +3960,13 @@ class MainFrame(wx.Frame):
                             wx.YES_NO | wx.ICON_INFORMATION, self)
         if ans == wx.YES:
             self.on_memo_check_now(None)
+
+    def _is_modal_dialog_open(self) -> bool:
+        """현재 자식 모달 대화상자가 열려 있는지."""
+        for child in self.GetChildren():
+            if isinstance(child, wx.Dialog) and child.IsModal():
+                return True
+        return False
 
     def restart_memo_notifier(self):
         """설정 변경 후 호출 — 기존 타이머 중단 후 새 주기로 재시작."""
@@ -3822,7 +3988,8 @@ class MainFrame(wx.Frame):
     def _on_new_memo(self, count: int, new_items: list):
         """새 쪽지 도착 콜백 — 알림 센터에 등록 + 사운드·TTS·제목바 업데이트.
 
-        자동 폴링에서 호출됨. 사용자가 원본을 열 때는 알림 센터에서 선택하여 연다.
+        모달 대화상자가 열려 있으면 사운드·TTS·팝업 모두 생략 — 사용자의
+        작업을 방해하지 않는다. 알림 센터에는 그대로 등록되어 나중에 확인 가능.
         """
         # 1. 알림 센터에 등록
         try:
@@ -3839,6 +4006,10 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
+        # 모달 대화상자 사용 중이면 이후 알림(소리·TTS·팝업) 모두 생략.
+        if self._is_modal_dialog_open():
+            return
+
         # 2. 사운드
         try:
             from sound import play_event
@@ -3846,9 +4017,8 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
-        # 3. 제목바 갱신
-        self._unread_memo_count += count
-        self._update_title_unread()
+        # 3. 제목 표시줄의 안 읽은 수는 MemoNotifier.on_unread_count 콜백이
+        # 매 tick 마다 서버 기준으로 갱신. 여기서는 누적 증가시키지 않는다.
 
         # 4. TTS
         sender = new_items[0].counterpart if new_items else "알 수 없음"
@@ -3857,7 +4027,7 @@ class MainFrame(wx.Frame):
         else:
             speak(f"새 쪽지가 {count}개 도착했습니다.")
 
-        # 5. 확인 대화상자 — Yes 면 알림 센터 오픈
+        # 5. 확인 대화상자 — Yes 면 알림 센터 오픈.
         if count == 1:
             msg = (
                 f"새 쪽지가 도착했습니다.\n"
@@ -3888,6 +4058,21 @@ class MainFrame(wx.Frame):
             self.SetTitle(f"{base} - {' · '.join(parts)}")
         else:
             self.SetTitle(base)
+
+    def _set_memo_unread_count(self, count: int):
+        """MemoNotifier 에서 매 tick 마다 서버 기준 '안 읽은 쪽지 수' 전달 시 호출.
+
+        읽거나 삭제해서 서버 상의 안 읽은 수가 줄면 제목 표시줄에도 즉시 반영.
+        """
+        if getattr(self, "_unread_memo_count", 0) != count:
+            self._unread_memo_count = count
+            self._update_title_unread()
+
+    def _set_mail_unread_count(self, count: int):
+        """MailNotifier 에서 매 tick 마다 서버 기준 '안 읽은 메일 수' 전달 시 호출."""
+        if getattr(self, "_unread_mail_count", 0) != count:
+            self._unread_mail_count = count
+            self._update_title_unread()
 
     def on_open_memo_compose(self, event):
         """도구 > 쪽지 쓰기 (Ctrl+Shift+M)."""

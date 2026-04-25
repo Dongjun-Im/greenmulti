@@ -3,9 +3,9 @@ import os
 import sys
 
 # 앱 정보
-APP_NAME = "초록멀티 v1.5"
-APP_VERSION = "1.5.3"
-APP_BUILD_DATE = "2026-04-23"
+APP_NAME = "초록멀티 v1.6"
+APP_VERSION = "1.6.0"
+APP_BUILD_DATE = "2026-04-25"
 APP_AUTHOR = "임동준"
 APP_EMAIL = "d.june0503@gmail.com"
 APP_ADMIN_EMAIL = "greenlightsori@gmail.com"
@@ -33,6 +33,9 @@ SOUNDS_DIR = os.path.join(BASE_DIR, "sounds")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CREDENTIALS_FILE = os.path.join(DATA_DIR, "credentials.ini")
 MENU_LIST_FILE = os.path.join(DATA_DIR, "menu_list.json")
+# 사용자가 직접 편집할 수 있는 텍스트 메뉴 파일. 존재하면 자동 감지 결과를
+# 덮어쓴다. 포맷은 한 줄에 "이름 | URL | 타입" (타입은 선택).
+MENU_LIST_TXT_FILE = os.path.join(DATA_DIR, "menu_list.txt")
 
 # 소리샘 URL
 SORISEM_BASE_URL = "https://www.sorisem.net"

@@ -29,6 +29,7 @@ from config import (
 )
 from screen_reader import speak
 from theme import apply_theme, make_font, load_font_size
+from post_dialog import ContextMenuTextCtrl
 
 
 # ── 데이터 클래스 ──
@@ -145,15 +146,28 @@ def _parse_memo_list(html: str) -> list[MemoItem]:
         date = cell_text(3)
         read_cell = cell_text(4)
 
-        # 안 읽음 판단 — ar.memo 는 읽음 컬럼에 "아직 읽지 않음" / 읽은 시각 표시.
-        # gnuboard5 표준 테마는 "O"/"X" 또는 envelope 아이콘.
+        # 안 읽음 판단 — 행 전체 HTML 에서 단서를 폭넓게 검색한다.
+        # ar.memo 는 읽음 컬럼에 "아직 읽지 않음" / 읽은 시각을 적기도 하고,
+        # 일부 테마는 아이콘·CSS class 로만 표시한다.
         is_read = True
-        row_html = str(cells[4]) if len(cells) > 4 else ""
-        if re.search(r"읽지\s*않|안\s*읽|미열람|미확인|미읽음", read_cell):
+        full_row_html = str(tr).lower()
+        cell5_html = str(cells[4]).lower() if len(cells) > 4 else ""
+        if re.search(
+            r"읽지\s*않|안\s*읽|안읽음|미열람|미확인|미읽|아직",
+            full_row_html,
+        ):
             is_read = False
-        elif read_cell.strip() in ("X", "x", "", "-"):
+        elif read_cell.strip() in ("X", "x", "", "-", "N", "n", "○", "●"):
             is_read = False
-        elif "envelope-o" in row_html and "envelope-open" not in row_html:
+        elif "envelope-o" in cell5_html and "envelope-open" not in cell5_html:
+            is_read = False
+        elif re.search(
+            r'class\s*=\s*["\'][^"\']*\b(new|unread|notread|hot)\b'
+            r'|src\s*=\s*["\'][^"\']*(?:new|unread)[^"\']*\.(?:gif|png|jpg|svg|webp)'
+            r'|alt\s*=\s*["\'][^"\']*(?:new|unread|안\s*읽|미\s*열람|미\s*확인|미\s*읽|새)'
+            r'|ico_new|icon[-_]new|new[-_]?icon|newmsg|memo[-_]?new',
+            full_row_html,
+        ):
             is_read = False
 
         items.append(MemoItem(
@@ -693,6 +707,9 @@ class MemoNotifier:
         self.frame = parent_frame
         self.session = session
         self.callback = callback_on_new
+        # 주기마다 서버의 현재 "안 읽은" 쪽지 수를 UI에 알려주는 콜백(선택).
+        # main_frame 에서 제목 표시줄 갱신에 사용한다.
+        self.on_unread_count = None
         self.seen_me_ids: set[str] = set()
         self._in_flight = False
         self._initial_done = False
@@ -705,12 +722,27 @@ class MemoNotifier:
         _notify_log(f"start(interval={interval_sec}s) — initial_fill in bg")
         import threading
         def init_worker():
+            import wx as _wx
             try:
                 ok, items = fetch_inbox(self.session, kind="recv")
                 if ok:
+                    # 시작 시 "읽은" 쪽지만 seen 으로 등록. 안 읽은 쪽지는 의도적
+                    # 으로 seen 에서 빼두어, 첫 polling tick 에서 신규 항목으로
+                    # 감지되어 사용자에게 즉시 알림이 울린다.
+                    seen_count = 0
+                    unread_count = 0
                     for it in items:
-                        self.seen_me_ids.add(it.me_id)
-                    _notify_log(f"initial_fill OK: {len(items)} items marked seen")
+                        if getattr(it, "is_read", True):
+                            self.seen_me_ids.add(it.me_id)
+                            seen_count += 1
+                        else:
+                            unread_count += 1
+                    if self.on_unread_count is not None:
+                        _wx.CallAfter(self.on_unread_count, unread_count)
+                    _notify_log(
+                        f"initial_fill OK: {seen_count} read seen, "
+                        f"{unread_count} unread will alert"
+                    )
                 else:
                     _notify_log(f"initial_fill FAIL: {items}")
             except Exception as e:
@@ -746,8 +778,16 @@ class MemoNotifier:
             if not ok:
                 _notify_log(f"fetch_inbox failed: {items}")
                 return
+            # 현재 서버 기준 안 읽은 쪽지 총개수를 UI(제목 표시줄)에 전달.
+            # 사용자가 읽거나 삭제하면 다음 tick 에서 이 숫자가 줄어 제목이 갱신된다.
+            unread_count = sum(1 for it in items if not getattr(it, "is_read", True))
+            if self.on_unread_count is not None:
+                _wx.CallAfter(self.on_unread_count, unread_count)
             new_items = [it for it in items if it.me_id not in self.seen_me_ids]
-            _notify_log(f"check: total={len(items)} seen={len(self.seen_me_ids)} new={len(new_items)}")
+            _notify_log(
+                f"check: total={len(items)} seen={len(self.seen_me_ids)} "
+                f"new={len(new_items)} unread={unread_count}"
+            )
             if not new_items:
                 return
             for it in new_items:
@@ -900,7 +940,8 @@ class MemoViewDialog(wx.Dialog):
         # 메타+본문 통합 표시용 단일 read-only TextCtrl.
         # 스크린리더가 아래 방향키로 작성 날짜 → 작성 시간 → 보낸/받는 사람 →
         # 빈 줄 → "내용:" → 본문 순으로 자연스럽게 읽어 내려갈 수 있게 한 영역에 통합.
-        self.body_ctrl = wx.TextCtrl(
+        # ContextMenuTextCtrl 를 써서 팝업 키에서도 커스텀 메뉴가 뜨도록 한다.
+        self.body_ctrl = ContextMenuTextCtrl(
             panel, value="",
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
         )
@@ -936,6 +977,7 @@ class MemoViewDialog(wx.Dialog):
 
         # 단축키
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.body_ctrl.bind_context_menu(self._on_body_context_menu)
 
         # 초기 표시
         self._refresh_display(announce=False)
@@ -943,6 +985,25 @@ class MemoViewDialog(wx.Dialog):
         # 본문으로 포커스
         self.body_ctrl.SetFocus()
         self.body_ctrl.SetInsertionPoint(0)
+
+    def _on_body_context_menu(self, event):
+        """쪽지 보기 팝업 메뉴 — 답장·삭제 등 쪽지 액션.
+
+        이전/다음 쪽지 이동은 내비게이션이므로 제외.
+        """
+        menu = wx.Menu()
+
+        if self.kind == "recv":
+            id_reply = wx.NewIdRef()
+            menu.Append(id_reply, "답장(&R)")
+            self.Bind(wx.EVT_MENU, self.on_reply, id=id_reply)
+
+        id_del = wx.NewIdRef()
+        menu.Append(id_del, "삭제(&D)")
+        self.Bind(wx.EVT_MENU, self.on_delete, id=id_del)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
 
     def _refresh_display(self, announce: bool = True):
         """현재 self.content 기준으로 meta·body·버튼 상태 갱신."""
@@ -1198,6 +1259,8 @@ class MemoInboxDialog(wx.Dialog):
         self.kind = "recv"
         self.items: list[MemoItem] = []
         self._index = 0
+        # Shift+좌/우 필드 순회용 인덱스. 항목이 바뀌면 0 으로 초기화.
+        self._field_index = 0
 
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
@@ -1241,9 +1304,48 @@ class MemoInboxDialog(wx.Dialog):
         apply_theme(self, make_font(load_font_size()))
 
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.list_ctrl.Bind(wx.EVT_CONTEXT_MENU, self._on_list_context_menu)
         self.list_ctrl.SetFocus()
 
         wx.CallAfter(self.reload)
+
+    def _on_list_context_menu(self, event):
+        """쪽지함 팝업 메뉴 — 새 쪽지·답장·삭제 등 쪽지 관련 액션 모음.
+
+        ↑↓·PgUp/PgDn 이동은 내비게이션이므로 제외.
+        """
+        menu = wx.Menu()
+
+        id_compose = wx.NewIdRef()
+        menu.Append(id_compose, "새 쪽지 쓰기(&N)")
+        self.Bind(wx.EVT_MENU, self.on_compose, id=id_compose)
+
+        if self.items:
+            id_open = wx.NewIdRef()
+            menu.Append(id_open, "선택한 쪽지 읽기(&O)")
+            self.Bind(wx.EVT_MENU, lambda e: self._open_current(), id=id_open)
+
+            id_reply = wx.NewIdRef()
+            menu.Append(id_reply, "답장(&R)")
+            self.Bind(wx.EVT_MENU, lambda e: self._reply_current(), id=id_reply)
+
+            id_del = wx.NewIdRef()
+            menu.Append(id_del, "선택한 쪽지 삭제(&D)")
+            self.Bind(wx.EVT_MENU, lambda e: self._delete_current(), id=id_del)
+
+        menu.AppendSeparator()
+
+        id_refresh = wx.NewIdRef()
+        menu.Append(id_refresh, "새로고침(&F)")
+        self.Bind(wx.EVT_MENU, lambda e: self.reload(), id=id_refresh)
+
+        if self.items:
+            id_del_all = wx.NewIdRef()
+            menu.Append(id_del_all, "모든 쪽지 삭제(&A)")
+            self.Bind(wx.EVT_MENU, self.on_delete_all, id=id_del_all)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
 
     def _switch(self, kind: str):
         if kind == self.kind:
@@ -1252,6 +1354,17 @@ class MemoInboxDialog(wx.Dialog):
         self.reload()
 
     def reload(self):
+        # 쪽지함을 새로 그릴 때마다 알림 봇의 seen_me_ids 도 함께 갱신해,
+        # 삭제로 인해 페이지 안에 새로 드러난 옛 쪽지가 다음 polling tick 에서
+        # "새 쪽지"로 오인되지 않게 한다.
+        if self.kind == "recv":
+            try:
+                top = wx.GetTopLevelParent(self)
+                notifier = getattr(top, "_memo_notifier", None)
+                if notifier is not None:
+                    notifier.mark_all_as_seen()
+            except Exception:
+                pass
         self.status_label.SetLabel(
             f"{'받은' if self.kind == 'recv' else '보낸'} 쪽지함 불러오는 중..."
         )
@@ -1299,8 +1412,17 @@ class MemoInboxDialog(wx.Dialog):
 
     def _format_item(self, i: int, item: MemoItem) -> str:
         label_who = "보낸이" if self.kind == "recv" else "받는이"
-        unread = " [안읽음]" if self.kind == "recv" and not item.is_read else ""
-        return f"{i+1}/{len(self.items)}{unread} · {label_who}: {item.counterpart} · {item.date} · {item.summary}"
+        # 받은함은 읽음/안읽음 상태를 항상 맨 앞에 표시 — 스크린리더가 가장
+        # 먼저 읽도록 한다. 보낸함은 표시하지 않는다.
+        if self.kind == "recv":
+            status = "안 읽음" if not getattr(item, "is_read", True) else "읽음"
+            prefix = f"{status} · "
+        else:
+            prefix = ""
+        return (
+            f"{prefix}{i+1}/{len(self.items)} · {label_who}: {item.counterpart} · "
+            f"{item.date} · {item.summary}"
+        )
 
     def _update_display(self):
         if not self.items:
@@ -1316,7 +1438,42 @@ class MemoInboxDialog(wx.Dialog):
         """ListBox 의 현재 선택을 self._index 에 반영."""
         sel = self.list_ctrl.GetSelection()
         if sel != wx.NOT_FOUND:
+            if sel != self._index:
+                self._field_index = 0
             self._index = sel
+
+    def _get_fields(self, item: MemoItem) -> list[tuple[str, str]]:
+        """현재 쪽지 항목에서 Shift+좌/우 로 순회할 필드 목록."""
+        fields: list[tuple[str, str]] = []
+        if self.kind == "recv":
+            status = "안 읽음" if not getattr(item, "is_read", True) else "읽음"
+            fields.append(("상태", status))
+            fields.append(("보낸이", item.counterpart or ""))
+        else:
+            fields.append(("받는이", item.counterpart or ""))
+        fields.append(("날짜", item.date or ""))
+        fields.append(("요약", item.summary or ""))
+        return fields
+
+    def _read_field(self, direction: int):
+        """현재 선택된 쪽지의 필드를 한 칸 이동해서 음성으로 안내."""
+        if not self.items:
+            return
+        item = self.items[self._index]
+        fields = self._get_fields(item)
+        if not fields:
+            return
+        self._field_index += direction
+        if self._field_index < 0:
+            self._field_index = 0
+            speak("첫 번째 필드")
+            return
+        if self._field_index >= len(fields):
+            self._field_index = len(fields) - 1
+            speak("마지막 필드")
+            return
+        name, value = fields[self._field_index]
+        speak(f"{name} {value}" if value else name)
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
@@ -1334,6 +1491,15 @@ class MemoInboxDialog(wx.Dialog):
         if key == wx.WXK_RETURN and not mods:
             self._sync_index_from_listbox()
             self._open_current()
+            return
+        # Shift+좌/우: 필드 단위로 이동 — 게시판 목록과 동일한 동작.
+        if key == wx.WXK_LEFT and event.ShiftDown() and not event.ControlDown():
+            self._sync_index_from_listbox()
+            self._read_field(-1)
+            return
+        if key == wx.WXK_RIGHT and event.ShiftDown() and not event.ControlDown():
+            self._sync_index_from_listbox()
+            self._read_field(1)
             return
         # Shift+Del 은 전체 삭제 (D/Del 단독보다 먼저 검사)
         if key == wx.WXK_DELETE and event.ShiftDown() and not event.ControlDown() and not event.AltDown():

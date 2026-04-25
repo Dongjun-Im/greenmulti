@@ -28,6 +28,7 @@ from config import (
 )
 from screen_reader import speak
 from theme import apply_theme, make_font, load_font_size
+from post_dialog import ContextMenuTextCtrl
 
 
 @dataclass
@@ -508,10 +509,28 @@ def fetch_mail_list(session: requests.Session, kind: str = "recv",
         # MailItem 은 sender 필드만 가지므로 recipient 를 sender 로 대체 (표시용).
         display_sender = sender or recipient or "(알 수 없음)"
 
+        # 읽음 여부 판정 — 행 전체 HTML 에서 안 읽음 단서를 폭넓게 검색한다.
+        # gnuboard5 계열은 안 읽은 메일을 텍스트가 아니라 작은 아이콘 이미지나
+        # CSS 클래스로만 표시하는 경우가 흔해, 단순 텍스트 검사로는 놓친다.
+        row_html_lower = str(tr).lower()
         is_read = True
-        if re.search(r"읽지\s*않|안\s*읽|미열람|미확인", read_cell):
+        # 텍스트 기반 단서
+        if re.search(
+            r"읽지\s*않|안\s*읽|안읽음|미열람|미확인|미읽|읽음\s*아니|아직",
+            row_html_lower,
+        ):
             is_read = False
-        elif read_cell.strip() in ("X", "x", "-"):
+        # 이미지·클래스·src 등 마크업 기반 단서
+        elif re.search(
+            r'class\s*=\s*["\'][^"\']*\b(new|unread|notread|hot)\b'
+            r'|src\s*=\s*["\'][^"\']*(?:new|unread|hot)[^"\']*\.(?:gif|png|jpg|svg|webp)'
+            r'|alt\s*=\s*["\'][^"\']*(?:new|unread|안\s*읽|미\s*열람|미\s*확인|미\s*읽|새|hot)'
+            r'|ico_new|icon[-_]new|new[-_]?icon|newmsg|memo[-_]?new|mail[-_]?new',
+            row_html_lower,
+        ):
+            is_read = False
+        # 단독 X/-/N 마커 (텍스트만 들어 있는 셀)
+        elif read_cell.strip() in ("X", "x", "-", "N", "n", "○", "●"):
             is_read = False
 
         items.append(MailItem(
@@ -1097,18 +1116,31 @@ class MailNotifier:
         self.seen_ids: set[str] = set()
         self._in_flight = False
         self._initial_done = False
+        # 주기마다 서버의 현재 안 읽은 메일 수를 UI 에 알려주는 콜백(선택).
+        self.on_unread_count = None
         # Mail 은 별도 타이머 쓰지 않고 MemoNotifier 와 공통 타이머 공유 가능.
         # 여기서는 단순화 — 외부에서 poll_once() 직접 호출.
 
     def start_initial_fill(self):
-        """앱 시작 시 현재 메일함의 모든 mail_id 를 seen 처리 (스팸 방지)."""
-        import threading
+        """앱 시작 시 메일함 초기화.
+
+        "읽은" 메일만 seen 으로 등록. 안 읽은 메일은 의도적으로 빼두어
+        첫 polling tick 에서 신규 항목으로 감지되어 알림이 발사된다.
+        현재 안 읽은 총개수는 on_unread_count 콜백을 통해 제목 표시줄에 반영.
+        """
+        import threading, wx as _wx
         def worker():
             try:
                 ok, items = fetch_mail_inbox(self.session)
                 if ok and isinstance(items, list):
                     for it in items:
-                        self.seen_ids.add(it.mail_id)
+                        if getattr(it, "is_read", True):
+                            self.seen_ids.add(it.mail_id)
+                    unread_count = sum(
+                        1 for it in items if not getattr(it, "is_read", True)
+                    )
+                    if self.on_unread_count is not None:
+                        _wx.CallAfter(self.on_unread_count, unread_count)
             except Exception:
                 pass
             finally:
@@ -1132,6 +1164,12 @@ class MailNotifier:
                 ok, items = fetch_mail_inbox(self.session)
                 if not ok or not isinstance(items, list):
                     return
+                # 현재 서버 기준 안 읽은 메일 총개수를 UI(제목 표시줄)에 전달.
+                unread_count = sum(
+                    1 for it in items if not getattr(it, "is_read", True)
+                )
+                if self.on_unread_count is not None:
+                    _wx.CallAfter(self.on_unread_count, unread_count)
                 new = [it for it in items if it.mail_id not in self.seen_ids]
                 if not new:
                     return
@@ -1144,6 +1182,24 @@ class MailNotifier:
                 self._in_flight = False
                 if on_done:
                     _wx.CallAfter(on_done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def mark_all_as_seen(self):
+        """현재 받은함의 모든 mail_id 를 seen 으로 갱신.
+
+        메일함을 사용자가 직접 본 뒤(읽음·삭제 등) 호출. 다음 polling tick 에서
+        삭제로 인해 페이지에 새로 드러난 옛 메일을 "신규 도착"으로 오인해
+        팝업이 뜨는 문제를 막는다.
+        """
+        import threading
+        def worker():
+            try:
+                ok, items = fetch_mail_inbox(self.session)
+                if ok and isinstance(items, list):
+                    for it in items:
+                        self.seen_ids.add(it.mail_id)
+            except Exception:
+                pass
         threading.Thread(target=worker, daemon=True).start()
 
     def get_all_unread_async(self, on_result):
@@ -1506,8 +1562,8 @@ class MailViewDialog(wx.Dialog):
         self._panel = panel
         vbox = wx.BoxSizer(wx.VERTICAL)
 
-        # 메타+본문 통합 TextCtrl
-        self.body_ctrl = wx.TextCtrl(
+        # 메타+본문 통합 TextCtrl — 팝업 키로 커스텀 컨텍스트 메뉴가 뜨도록 서브클래스 사용
+        self.body_ctrl = ContextMenuTextCtrl(
             panel, value="",
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
         )
@@ -1539,18 +1595,50 @@ class MailViewDialog(wx.Dialog):
         panel.SetSizer(vbox)
         apply_theme(self, make_font(load_font_size()))
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.body_ctrl.bind_context_menu(self._on_body_context_menu)
 
         self._refresh_display(announce=False)
         self.body_ctrl.SetFocus()
         self.body_ctrl.SetInsertionPoint(0)
 
+    def _on_body_context_menu(self, event):
+        """메일 보기 팝업 메뉴 — 답장·삭제·본문 저장 등 메일 액션.
+
+        이전/다음 메일 이동은 내비게이션이므로 제외.
+        """
+        menu = wx.Menu()
+
+        if self.kind == "recv":
+            id_reply = wx.NewIdRef()
+            menu.Append(id_reply, "답장(&R)")
+            self.Bind(wx.EVT_MENU, self.on_reply, id=id_reply)
+
+        id_del = wx.NewIdRef()
+        menu.Append(id_del, "삭제(&D)")
+        self.Bind(wx.EVT_MENU, self.on_delete, id=id_del)
+
+        if getattr(self.content, "attachments", None):
+            menu.AppendSeparator()
+            id_att = wx.NewIdRef()
+            menu.Append(id_att, "첨부파일 전체 저장(&S)")
+            self.Bind(wx.EVT_MENU, self.on_download_all_attachments, id=id_att)
+
+        menu.AppendSeparator()
+        id_save_body = wx.NewIdRef()
+        menu.Append(id_save_body, "본문 텍스트 저장(&B)")
+        self.Bind(wx.EVT_MENU, self.on_download_body, id=id_save_body)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
+
     def _refresh_display(self, announce: bool = True):
         kind_label = "받은 메일" if self.content.kind == "recv" else "보낸 메일"
         total = len(self.items)
+        subject = (self.content.subject or "").strip() or "(제목 없음)"
         if total:
-            self.SetTitle(f"{kind_label} ({self.index + 1}/{total})")
+            self.SetTitle(f"{subject} — {kind_label} ({self.index + 1}/{total})")
         else:
-            self.SetTitle(kind_label)
+            self.SetTitle(f"{subject} — {kind_label}")
 
         # 날짜/시간 분리
         date_part = time_part = ""
@@ -1988,6 +2076,8 @@ class MailInboxDialog(wx.Dialog):
         self.kind = "recv"
         self.items: list = []
         self._index = 0
+        # Shift+좌/우 필드 순회용 인덱스. 항목이 바뀌면 0 으로 초기화.
+        self._field_index = 0
 
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
@@ -2027,8 +2117,47 @@ class MailInboxDialog(wx.Dialog):
         panel.SetSizer(vbox)
         apply_theme(self, make_font(load_font_size()))
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
+        self.list_ctrl.Bind(wx.EVT_CONTEXT_MENU, self._on_list_context_menu)
         self.list_ctrl.SetFocus()
         wx.CallAfter(self.reload)
+
+    def _on_list_context_menu(self, event):
+        """메일함 팝업 메뉴 — 새 메일·답장·삭제 등 메일 관련 액션 모음.
+
+        ↑↓·PgUp/PgDn 이동은 내비게이션이므로 제외.
+        """
+        menu = wx.Menu()
+
+        id_compose = wx.NewIdRef()
+        menu.Append(id_compose, "새 메일 쓰기(&N)")
+        self.Bind(wx.EVT_MENU, self.on_compose, id=id_compose)
+
+        if self.items:
+            id_open = wx.NewIdRef()
+            menu.Append(id_open, "선택한 메일 읽기(&O)")
+            self.Bind(wx.EVT_MENU, lambda e: self._open_current(), id=id_open)
+
+            id_reply = wx.NewIdRef()
+            menu.Append(id_reply, "답장(&R)")
+            self.Bind(wx.EVT_MENU, lambda e: self._reply_current(), id=id_reply)
+
+            id_del = wx.NewIdRef()
+            menu.Append(id_del, "선택한 메일 삭제(&D)")
+            self.Bind(wx.EVT_MENU, lambda e: self._delete_current(), id=id_del)
+
+        menu.AppendSeparator()
+
+        id_refresh = wx.NewIdRef()
+        menu.Append(id_refresh, "새로고침(&F)")
+        self.Bind(wx.EVT_MENU, lambda e: self.reload(), id=id_refresh)
+
+        if self.items:
+            id_del_all = wx.NewIdRef()
+            menu.Append(id_del_all, "모든 메일 삭제(&A)")
+            self.Bind(wx.EVT_MENU, self.on_delete_all, id=id_del_all)
+
+        self.PopupMenu(menu)
+        menu.Destroy()
 
     def _switch(self, kind: str):
         if kind == self.kind:
@@ -2038,6 +2167,17 @@ class MailInboxDialog(wx.Dialog):
 
     def reload(self):
         label = "받은" if self.kind == "recv" else "보낸"
+        # 메일함을 새로 그릴 때마다 알림 봇이 가지고 있는 seen_ids 도 함께
+        # 갱신해, 삭제로 인해 페이지 안에 새로 드러난 옛 메일이 다음 polling
+        # tick 에서 "새 메일"로 오인되지 않게 한다.
+        if self.kind == "recv":
+            try:
+                top = wx.GetTopLevelParent(self)
+                notifier = getattr(top, "_mail_notifier", None)
+                if notifier is not None:
+                    notifier.mark_all_as_seen()
+            except Exception:
+                pass
         self.status_label.SetLabel(f"{label} 메일함 불러오는 중...")
         try:
             from settings_dialog import load_notify_settings
@@ -2070,13 +2210,61 @@ class MailInboxDialog(wx.Dialog):
 
     def _format_item(self, i: int, item) -> str:
         who_label = "보낸이" if self.kind == "recv" else "받는이"
-        unread = " [안읽음]" if self.kind == "recv" and not item.is_read else ""
-        return f"{i+1}/{len(self.items)}{unread} · {who_label}: {item.sender} · {item.date} · {item.subject}"
+        # 받은함은 안읽음/읽음 상태를 항상 맨 앞에 표시해 스크린리더가 가장
+        # 먼저 읽도록 한다. 보낸함은 읽음 개념이 다르므로 표시하지 않는다.
+        if self.kind == "recv":
+            status = "안 읽음" if not getattr(item, "is_read", True) else "읽음"
+            prefix = f"{status} · "
+        else:
+            prefix = ""
+        return (
+            f"{prefix}{i+1}/{len(self.items)} · {who_label}: {item.sender} · "
+            f"{item.date} · {item.subject}"
+        )
 
     def _sync_index(self):
         sel = self.list_ctrl.GetSelection()
         if sel != wx.NOT_FOUND:
+            if sel != self._index:
+                # 항목이 바뀌면 필드 인덱스 초기화 — 새 항목의 첫 필드부터.
+                self._field_index = 0
             self._index = sel
+
+    def _get_fields(self, item) -> list[tuple[str, str]]:
+        """현재 메일 항목에서 Shift+좌/우 로 순회할 필드 목록.
+
+        받은함은 읽음 상태도 포함. 보낸함은 받는이로 라벨만 다름.
+        """
+        fields: list[tuple[str, str]] = []
+        if self.kind == "recv":
+            status = "안 읽음" if not getattr(item, "is_read", True) else "읽음"
+            fields.append(("상태", status))
+            fields.append(("보낸이", item.sender or ""))
+        else:
+            fields.append(("받는이", item.sender or ""))
+        fields.append(("날짜", item.date or ""))
+        fields.append(("제목", item.subject or ""))
+        return fields
+
+    def _read_field(self, direction: int):
+        """현재 선택된 메일의 필드를 한 칸 이동해서 음성으로 안내."""
+        if not self.items:
+            return
+        item = self.items[self._index]
+        fields = self._get_fields(item)
+        if not fields:
+            return
+        self._field_index += direction
+        if self._field_index < 0:
+            self._field_index = 0
+            speak("첫 번째 필드")
+            return
+        if self._field_index >= len(fields):
+            self._field_index = len(fields) - 1
+            speak("마지막 필드")
+            return
+        name, value = fields[self._field_index]
+        speak(f"{name} {value}" if value else name)
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
@@ -2090,6 +2278,12 @@ class MailInboxDialog(wx.Dialog):
             return
         if key == wx.WXK_RETURN and not mods:
             self._sync_index(); self._open_current(); return
+        # Shift+좌/우: 필드 단위로 이동(보낸이/날짜/제목/안읽음 등) — 스크린리더가
+        # 각 필드를 따로 읽어 사용자가 정보를 한 조각씩 확인할 수 있다.
+        if key == wx.WXK_LEFT and event.ShiftDown() and not event.ControlDown():
+            self._sync_index(); self._read_field(-1); return
+        if key == wx.WXK_RIGHT and event.ShiftDown() and not event.ControlDown():
+            self._sync_index(); self._read_field(1); return
         # Shift+Del 은 전체 삭제 (D/Del 단독보다 먼저 검사)
         if key == wx.WXK_DELETE and event.ShiftDown() and not event.ControlDown() and not event.AltDown():
             self.on_delete_all(None); return
