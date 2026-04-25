@@ -69,24 +69,27 @@ jobs:
         run: |
           $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
           chcp 65001 > $null
-          $dist = "dist/초록멀티 v${{ steps.vars.outputs.version }}"
-          if (-not (Test-Path $dist)) {
-            $dist = Get-ChildItem "dist" -Directory | Select-Object -First 1 -ExpandProperty FullName
-          }
-          $parent = Split-Path $dist -Parent
+          # PyInstaller 가 만든 dist 의 첫 디렉터리(이름은 한글)를 그대로 압축하되,
+          # 출력 ZIP 파일명은 GitHub 자산명 제약(ASCII) 에 맞춰 ASCII 로 강제.
+          # 압축 안의 폴더는 그대로 한글이라 사용자가 풀면 "초록멀티 v1.6/" 폴더가 생긴다.
+          $dist = Get-ChildItem "dist" -Directory | Select-Object -First 1 -ExpandProperty FullName
           $name = Split-Path $dist -Leaf
-          $zip = "installer_out/${name}.zip"
+          $zip = "$env:GITHUB_WORKSPACE/installer_out/chorokmulti_v${{ steps.vars.outputs.version }}.zip"
           New-Item -ItemType Directory -Force -Path "installer_out" | Out-Null
-          Push-Location $parent
-          Compress-Archive -Path $name -DestinationPath "$env:GITHUB_WORKSPACE/$zip" -Force
+          Push-Location (Split-Path $dist -Parent)
+          Compress-Archive -Path $name -DestinationPath $zip -Force
           Pop-Location
 
-      - name: Normalize asset filenames (Korean prefix)
+      - name: Generate SHA256 checksum for installer
         shell: pwsh
         run: |
           $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
           chcp 65001 > $null
-          python scripts/rename_release_assets.py
+          $setup = Get-ChildItem "installer_out" -Filter "*.exe" | Select-Object -First 1
+          if ($setup) {
+            $hash = (Get-FileHash -Algorithm SHA256 $setup.FullName).Hash.ToLower()
+            "$hash  $($setup.Name)" | Out-File -FilePath "$($setup.FullName).sha256" -Encoding ascii
+          }
 
       - name: Generate manifest.json (delta update support)
         shell: pwsh
