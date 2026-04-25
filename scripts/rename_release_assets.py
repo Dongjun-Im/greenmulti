@@ -16,6 +16,14 @@ import os
 import shutil
 import sys
 
+# Windows runner 에서 stdout/stderr 가 cp1252 라 한글 print 가 깨진다.
+# 강제로 UTF-8 로 재구성해 한글이 로그에 그대로 남도록 한다.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def _rename(src: str, dst: str) -> None:
     if not os.path.exists(src):
