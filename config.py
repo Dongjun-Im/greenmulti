@@ -4,7 +4,7 @@ import sys
 
 # 앱 정보
 APP_NAME = "초록멀티 v1.6"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 APP_BUILD_DATE = "2026-04-25"
 APP_AUTHOR = "임동준"
 APP_EMAIL = "d.june0503@gmail.com"

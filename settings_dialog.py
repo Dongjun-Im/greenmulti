@@ -522,16 +522,24 @@ class UpdatePage(wx.Panel):
         speak("건너뛴 버전을 해제했습니다.")
 
     def _on_check_now(self, event):
-        # 메인 프레임의 수동 체크 경로를 재사용.
+        """설정 창을 닫은 뒤 메인 프레임의 수동 업데이트 확인을 실행.
+
+        설정 창이 모달인 상태에서 업데이트 확인이 자식 MessageBox 를 띄우면
+        모달 스택 충돌·포커스 문제가 발생해 스크린리더가 "사용 불가" 로
+        안내하거나 동작이 멈추는 현상이 있다. 그래서 OK 절차로 설정 창을
+        먼저 닫고, 닫힘 직후 wx.CallAfter 로 업데이트 확인을 실행한다.
+        """
         top = wx.GetTopLevelParent(self)
-        # SettingsDialog 의 부모 프레임을 찾아 거슬러 올라간다.
         frame = top.GetParent() if isinstance(top, wx.Dialog) else top
         runner = getattr(frame, "on_manual_update_check", None)
-        if callable(runner):
-            speak("업데이트를 확인합니다.")
-            runner(None)
-        else:
+        if not callable(runner):
             speak("업데이트 확인 기능을 찾을 수 없습니다.")
+            return
+        # 설정 창 닫기 — 사용자의 현재 설정 변경 사항은 OK 흐름을 따라 저장.
+        if isinstance(top, wx.Dialog):
+            top.EndModal(wx.ID_OK)
+        # 다이얼로그가 정리된 뒤 메인 프레임에서 업데이트 확인 실행.
+        wx.CallAfter(runner, None)
 
     def collect(self) -> dict:
         s = load_update_settings()

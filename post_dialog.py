@@ -623,8 +623,12 @@ class PostDialog(wx.Dialog):
         display = self._comment_displays[new_index]
         # 1) TextCtrl 을 비워 스크린리더가 커서 위치 글자를 읽지 않게 함
         self.comment_ctrl.ChangeValue("")
-        # 2) 전체 텍스트를 직접 낭독
-        speak(display)
+        # 2) 전체 텍스트를 직접 낭독.
+        #    줄바꿈 문자를 ". " 로 바꾸어 스크린리더가 줄 끝마다 "빈줄" 을 읽지
+        #    않도록 한다. (NVDA·센스리더 등 한글 스크린리더가 다줄 텍스트의
+        #    각 \n 을 빈 줄로 인식해 "빈줄" 을 발화하는 문제 회피.)
+        spoken = re.sub(r"\n+", ". ", display).strip()
+        speak(spoken)
         # 3) 스크린리더의 키 처리가 끝난 뒤 화면 표시 복원
         wx.CallLater(80, self._restore_comment_display, display)
         self._update_comment_buttons()
@@ -632,9 +636,12 @@ class PostDialog(wx.Dialog):
     def _restore_comment_display(self, display: str):
         """_jump_to_comment 에서 비웠던 댓글 내용을 화면에 다시 표시.
 
-        ChangeValue 를 써서 스크린리더 재낭독을 유발하지 않는다.
+        ChangeValue 를 써서 스크린리더 재낭독을 유발하지 않는다. 또 다줄
+        텍스트를 한 줄로 합쳐(`\\n` → ` · `) Windows 다줄 edit 컨트롤이 SR 에
+        끝빈줄("빈줄") 을 알리는 것을 막는다.
         """
-        self.comment_ctrl.ChangeValue(display)
+        visual = re.sub(r"\n+", " · ", display).strip()
+        self.comment_ctrl.ChangeValue(visual)
         self.comment_ctrl.SetInsertionPoint(0)
 
     def _update_comment_buttons(self):
@@ -695,6 +702,12 @@ class PostDialog(wx.Dialog):
                         body = body[:cut] + body[cut + cut:]
                         break
 
+            # 본문 양 끝의 공백·줄바꿈을 정리하고 내부 연속 빈 줄을 한 줄로
+            # 압축한다 — 그러지 않으면 본문 끝 빈 줄을 스크린리더가 "빈줄"
+            # 이라고 따로 읽어 댓글 낭독이 끊겨 보인다.
+            body = (body or "").strip()
+            body = re.sub(r"\n\s*\n+", "\n", body)
+
             if body:
                 # 머리말(작성자·날짜)과 본문은 줄바꿈으로 구분해, 본문의 줄바꿈이
                 # 그대로 보존되도록 한다. comment_ctrl은 TE_MULTILINE 이므로
@@ -705,12 +718,15 @@ class PostDialog(wx.Dialog):
             else:
                 raw = "(빈 댓글)"
             # 줄바꿈 정규화만 수행 (탭은 공백으로). 본문의 \n 은 보존해서 다줄 표시.
-            raw = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+            raw = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").rstrip()
             display.append(raw)
 
         total = len(display)
         # 위치 정보는 마지막 줄에 별도 표시 — 본문 글자 낭독을 방해하지 않도록.
-        display_with_index = [f"{text}\n({i + 1}/{total})" for i, text in enumerate(display)]
+        # text.rstrip() 로 본문과 위치 사이에 빈 줄이 끼지 않게 한다.
+        display_with_index = [
+            f"{text.rstrip()}\n({i + 1}/{total})" for i, text in enumerate(display)
+        ]
 
         self._comment_displays = display_with_index
         if display_with_index:
@@ -719,7 +735,12 @@ class PostDialog(wx.Dialog):
             # SetValue 로 설정해 포커스가 comment_ctrl 에 들어왔을 때 스크린리더가
             # 내용을 인식하도록 한다. (ChangeValue 는 EVT_TEXT 를 발사하지 않아
             # 스크린리더가 변경을 놓칠 수 있음.)
-            self.comment_ctrl.SetValue(display_with_index[self._comment_index])
+            # 다줄 텍스트를 한 줄로 합쳐 SR 가 끝빈줄을 "빈줄"로 발화하는 문제 회피.
+            visual = re.sub(
+                r"\n+", " · ",
+                display_with_index[self._comment_index],
+            ).strip()
+            self.comment_ctrl.SetValue(visual)
             self.comment_ctrl.SetInsertionPoint(0)
             self._update_comment_buttons()
         else:
