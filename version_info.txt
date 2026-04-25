@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 6, 0, 0),
-    prodvers=(1, 6, 0, 0),
+    filevers=(1, 6, 1, 0),
+    prodvers=(1, 6, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', '초록등대 동호회'),
             StringStruct('FileDescription', '초록멀티 - 소리샘 접근성 유틸리티'),
-            StringStruct('FileVersion', '1.6.0.0'),
+            StringStruct('FileVersion', '1.6.1.0'),
             StringStruct('InternalName', '초록멀티'),
             StringStruct('LegalCopyright', '© 2026 초록등대 동호회. All rights reserved.'),
             StringStruct('OriginalFilename', '초록멀티 v1.6.exe'),
             StringStruct('ProductName', '초록멀티 v1.6'),
-            StringStruct('ProductVersion', '1.6.0.0'),
+            StringStruct('ProductVersion', '1.6.1.0'),
           ]
         ),
       ]

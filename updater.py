@@ -19,7 +19,109 @@ from typing import Callable, Optional
 
 import requests
 
-from config import UPDATE_API_URL, UPDATE_LIST_API_URL
+from config import UPDATE_API_URL, UPDATE_LIST_API_URL, UPDATE_REPO, DATA_DIR
+
+
+# 응답 캐시 — 단시간 내 반복 호출을 줄여 GitHub API rate-limit(시간당 60회)
+# 에 걸릴 가능성을 낮춘다. 캐시는 단순 JSON 파일로 저장.
+_CACHE_TTL_SEC = 600  # 10분
+_CACHE_PATH = os.path.join(DATA_DIR, "update_check_cache.json")
+
+
+def _load_cache(channel: str) -> Optional[dict]:
+    """캐시가 유효(TTL 내, 같은 channel)하면 응답 dict 반환."""
+    import time
+    try:
+        if not os.path.exists(_CACHE_PATH):
+            return None
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        if cache.get("channel") != channel:
+            return None
+        ts = float(cache.get("timestamp", 0))
+        if time.time() - ts > _CACHE_TTL_SEC:
+            return None
+        return cache.get("data")
+    except Exception:
+        return None
+
+
+def _save_cache(channel: str, data: dict) -> None:
+    """API 응답을 캐시에 저장."""
+    import time
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "channel": channel,
+                "timestamp": time.time(),
+                "data": data,
+            }, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _fetch_via_html(timeout: float = 10.0) -> Optional[dict]:
+    """API 가 rate-limit 등으로 막혔을 때 GitHub 릴리스 HTML 페이지에서
+    최신 태그를 추출하는 폴백.
+
+    GitHub 의 https://github.com/<owner>/<repo>/releases/latest 는
+    `/releases/tag/<tag>` 로 302 리다이렉트하므로 Location 헤더만
+    읽으면 태그를 빠르게 알 수 있다. 자산 정보는 /releases/expanded_assets
+    HTML 을 추가로 가져와 다운로드 URL 을 추출한다.
+
+    실패하면 None 반환.
+    """
+    try:
+        # 1) /releases/latest 의 리다이렉트 대상에서 태그 얻기
+        url = f"https://github.com/{UPDATE_REPO}/releases/latest"
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "greenmulti-updater"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        location = resp.headers.get("Location", "")
+        m = re.search(r"/releases/tag/([^/?#]+)", location or resp.url)
+        if not m:
+            return None
+        tag = m.group(1)
+    except requests.RequestException:
+        return None
+
+    # 2) expanded_assets HTML 에서 자산 다운로드 URL 추출
+    assets: list[dict] = []
+    try:
+        ea_url = f"https://github.com/{UPDATE_REPO}/releases/expanded_assets/{tag}"
+        ea_resp = requests.get(
+            ea_url,
+            headers={"User-Agent": "greenmulti-updater"},
+            timeout=timeout,
+        )
+        if ea_resp.status_code == 200:
+            for m in re.finditer(
+                rf'href="(/{re.escape(UPDATE_REPO)}/releases/download/'
+                rf'{re.escape(tag)}/([^"]+))"',
+                ea_resp.text,
+            ):
+                href = "https://github.com" + m.group(1)
+                name = m.group(2)
+                assets.append({
+                    "name": name,
+                    "browser_download_url": href,
+                    "size": 0,
+                })
+    except requests.RequestException:
+        pass
+
+    return {
+        "tag_name": tag,
+        "name": tag,
+        "body": "",
+        "html_url": f"https://github.com/{UPDATE_REPO}/releases/tag/{tag}",
+        "prerelease": "-" in tag,
+        "assets": assets,
+    }
 
 
 class DownloadCancelled(Exception):
@@ -118,6 +220,14 @@ def check_latest_release(
     global _LAST_CHECK_ERROR
     _LAST_CHECK_ERROR = ""
     url = UPDATE_LIST_API_URL if channel == "beta" else UPDATE_API_URL
+
+    # 1) 캐시(10분 TTL) 우선 — 짧은 시간 내 반복 호출은 GitHub API
+    #    시간당 60회(IP 단위) 제한에 걸릴 수 있어 캐시로 회피한다.
+    cached = _load_cache(channel)
+    if cached is not None:
+        data = cached
+        return _build_release_info(data)
+
     try:
         if channel == "beta":
             resp = requests.get(
@@ -130,17 +240,25 @@ def check_latest_release(
                 timeout=timeout,
             )
             if resp.status_code != 200:
+                # rate limit 이거나 일시 장애일 때 HTML 폴백 시도
+                if resp.status_code in (403, 429, 502, 503, 504):
+                    fallback = _fetch_via_html(timeout=timeout)
+                    if fallback is not None:
+                        _save_cache(channel, fallback)
+                        return _build_release_info(fallback)
                 _LAST_CHECK_ERROR = (
                     f"HTTP {resp.status_code} ({url})"
                     + (" - 저장소가 비공개이거나 이름이 바뀌었을 수 있습니다."
                        if resp.status_code == 404 else "")
+                    + (" - GitHub API 시간당 호출 한도(rate limit)에 걸렸습니다. "
+                       "잠시 후 다시 시도해 주세요."
+                       if resp.status_code == 403 else "")
                 )
                 return None
             releases = resp.json()
             if not isinstance(releases, list) or not releases:
                 _LAST_CHECK_ERROR = "릴리스 목록이 비어 있습니다."
                 return None
-            # draft 제외. 버전 기준 내림차순 정렬.
             candidates = [r for r in releases if not r.get("draft")]
             if not candidates:
                 _LAST_CHECK_ERROR = "공개된 릴리스(draft 제외)가 없습니다."
@@ -160,17 +278,34 @@ def check_latest_release(
                 timeout=timeout,
             )
             if resp.status_code != 200:
+                if resp.status_code in (403, 429, 502, 503, 504):
+                    fallback = _fetch_via_html(timeout=timeout)
+                    if fallback is not None:
+                        _save_cache(channel, fallback)
+                        return _build_release_info(fallback)
                 _LAST_CHECK_ERROR = (
                     f"HTTP {resp.status_code} ({url})"
                     + (" - 저장소가 비공개이거나 이름이 바뀌었을 수 있습니다."
                        if resp.status_code == 404 else "")
+                    + (" - GitHub API 시간당 호출 한도(rate limit)에 걸렸습니다. "
+                       "잠시 후 다시 시도해 주세요."
+                       if resp.status_code == 403 else "")
                 )
                 return None
             data = resp.json()
     except requests.Timeout:
+        # 타임아웃·연결 실패 시에도 HTML 폴백을 한 번 시도
+        fb = _fetch_via_html(timeout=timeout)
+        if fb is not None:
+            _save_cache(channel, fb)
+            return _build_release_info(fb)
         _LAST_CHECK_ERROR = f"응답 시간 초과 ({int(timeout)}초): {url}"
         return None
     except requests.ConnectionError as e:
+        fb = _fetch_via_html(timeout=timeout)
+        if fb is not None:
+            _save_cache(channel, fb)
+            return _build_release_info(fb)
         _LAST_CHECK_ERROR = f"연결 실패: {e.__class__.__name__}"
         return None
     except requests.RequestException as e:
@@ -180,6 +315,16 @@ def check_latest_release(
         _LAST_CHECK_ERROR = f"응답 JSON 파싱 실패: {e}"
         return None
 
+    # 캐시에 저장 후, 자산 정보를 ReleaseInfo 로 정리해 반환.
+    _save_cache(channel, data)
+    return _build_release_info(data)
+
+
+def _build_release_info(data: dict) -> Optional[ReleaseInfo]:
+    """Release JSON(또는 캐시·HTML 폴백 dict) 한 개에서 ReleaseInfo 구성.
+
+    설치 파일/체크섬/zip/manifest 자산 URL 까지 모두 채운다.
+    """
     info = _parse_release_json(data)
     if info is None:
         return None
