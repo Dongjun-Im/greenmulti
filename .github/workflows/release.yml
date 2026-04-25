@@ -81,18 +81,12 @@ jobs:
           Compress-Archive -Path $name -DestinationPath "$env:GITHUB_WORKSPACE/$zip" -Force
           Pop-Location
 
-      - name: Generate SHA256 checksum for installer
+      - name: Normalize asset filenames (Korean prefix)
         shell: pwsh
         run: |
           $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
           chcp 65001 > $null
-          $setup = Get-ChildItem "installer_out" -Filter "*.exe" | Select-Object -First 1
-          if ($setup) {
-            $hash = (Get-FileHash -Algorithm SHA256 $setup.FullName).Hash.ToLower()
-            # utf8NoBOM 으로 저장 — 한글 파일명을 보존하면서 BOM 은 넣지 않아 단순 텍스트
-            # 파서가 첫 토큰을 16진수 해시로 정확히 인식하도록 한다.
-            "$hash  $($setup.Name)" | Out-File -FilePath "$($setup.FullName).sha256" -Encoding utf8NoBOM
-          }
+          python scripts/rename_release_assets.py
 
       - name: Generate manifest.json (delta update support)
         shell: pwsh

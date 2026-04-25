@@ -24,7 +24,10 @@ DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir=installer_out
-OutputBaseFilename=초록멀티_v1.6_setup
+; 빌드 시에는 ASCII 안전한 이름으로 저장하고, 워크플로의 후속 단계에서
+; Python 으로 한글 접두사를 붙여 리네임한다 (Windows runner 의 PowerShell·
+; ISCC 인코딩 처리에서 한글이 잘려 나가는 문제를 우회).
+OutputBaseFilename=chorokmulti_v1.6_setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
