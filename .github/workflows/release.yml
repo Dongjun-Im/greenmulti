@@ -48,6 +48,8 @@ jobs:
       - name: Build exe with PyInstaller
         shell: pwsh
         run: |
+          $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+          chcp 65001 > $null
           python -m PyInstaller chorok_multi.spec --noconfirm
 
       - name: Install Inno Setup
@@ -58,11 +60,15 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
+          $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+          chcp 65001 > $null
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
       - name: Create portable ZIP
         shell: pwsh
         run: |
+          $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+          chcp 65001 > $null
           $dist = "dist/초록멀티 v${{ steps.vars.outputs.version }}"
           if (-not (Test-Path $dist)) {
             $dist = Get-ChildItem "dist" -Directory | Select-Object -First 1 -ExpandProperty FullName
@@ -78,15 +84,21 @@ jobs:
       - name: Generate SHA256 checksum for installer
         shell: pwsh
         run: |
+          $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+          chcp 65001 > $null
           $setup = Get-ChildItem "installer_out" -Filter "*.exe" | Select-Object -First 1
           if ($setup) {
             $hash = (Get-FileHash -Algorithm SHA256 $setup.FullName).Hash.ToLower()
-            "$hash  $($setup.Name)" | Out-File -FilePath "$($setup.FullName).sha256" -Encoding ascii
+            # utf8NoBOM 으로 저장 — 한글 파일명을 보존하면서 BOM 은 넣지 않아 단순 텍스트
+            # 파서가 첫 토큰을 16진수 해시로 정확히 인식하도록 한다.
+            "$hash  $($setup.Name)" | Out-File -FilePath "$($setup.FullName).sha256" -Encoding utf8NoBOM
           }
 
       - name: Generate manifest.json (delta update support)
         shell: pwsh
         run: |
+          $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+          chcp 65001 > $null
           $dist = Get-ChildItem "dist" -Directory | Select-Object -First 1 -ExpandProperty FullName
           $exeName = (Get-ChildItem -Path $dist -Filter "*.exe" | Select-Object -First 1).Name
           $files = @()
@@ -101,7 +113,7 @@ jobs:
             files      = $files
           }
           $json = $manifest | ConvertTo-Json -Depth 5
-          $json | Out-File -FilePath "installer_out/manifest.json" -Encoding utf8
+          $json | Out-File -FilePath "installer_out/manifest.json" -Encoding utf8NoBOM
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

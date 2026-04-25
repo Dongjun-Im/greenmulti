@@ -1,8 +1,8 @@
-; 초록멀티 v1.6 — Inno Setup 설치 스크립트
+﻿; 초록멀티 v1.6 — Inno Setup 설치 스크립트
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.6.1"
+#define AppVersion "1.6.2"
 #define AppVersionDisplay "v1.6"
 #define AppPublisher "초록등대 동호회"
 #define AppExeName "초록멀티 v1.6.exe"
