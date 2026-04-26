@@ -899,6 +899,7 @@ class MainFrame(wx.Frame):
             "글쓰기", "게시판관리", "멀티업로드",
             "img", "관리자", "철머",
             "로그아웃", "돌아가기",
+            "소리샘 동사무소", "동사무소",
         }
         # 현재 메뉴명만 노이즈로 추가
         if clean_menu:
@@ -963,6 +964,13 @@ class MainFrame(wx.Frame):
         for m in sub_menus:
             url = (m.url or "").strip()
             url_lower = url.lower()
+
+            # 게시글 본문 링크(wr_id=) 는 하위 메뉴가 아님 — 제외
+            if "wr_id=" in url_lower:
+                _diag_lines.append(
+                    f"  REJECT [post_link] url={url!r} text={m.name!r}"
+                )
+                continue
 
             # 초록등대 동호회 자료실/엔터테인먼트 자료실 링크는 초록등대 동호회
             # 컨텍스트(cl=green)에서 하위 메뉴를 볼 때만 표시. 소리샘 자료실
@@ -1056,15 +1064,18 @@ class MainFrame(wx.Frame):
                     )
                     continue
             else:
-                # 클럽 아닌 일반 컨텍스트: 상위 섹션·카테고리 링크만 제외
-                if re.search(r"[?&]mo=", url_lower):
-                    if current_code and sub_code != current_code:
-                        continue
+                # 클럽 아닌 일반 컨텍스트:
+                # sorisem.net 은 `/?mo=XXX` 로 중첩 카테고리를 표현한다.
+                # 예) /?mo=potion(동호회) → /?mo=circle(일반 동호회) → /?mo=...
+                # 따라서 mo= 값이 현재와 다르다고 무조건 거부하면 안 된다.
+                # main_menu_urls 검사(이전 단계)가 이미 메인 메뉴와 정확히 같은
+                # URL 을 거부했으므로 여기서는 추가 거부를 최소화한다.
                 if re.search(r"[?&]clp=", url_lower):
                     continue
-                # 메인 메뉴 코드와 일치하는 경우도 거부 (단, 현재가 아닐 때)
-                # 자료실·엔터테인먼트 자료실 예외는 초록등대 동호회 컨텍스트
-                # (cl=green)에서만 유효.
+                # 다른 메인 메뉴 코드와 일치하는 경우 거부.
+                # 단, 자료실·엔터테인먼트 자료실 예외 + main_menu_urls 검사를
+                # 이미 통과한 항목이므로 여기서 거부되는 것은 동일 코드를 가진
+                # 다른 URL 패턴(드문 경우) 정도로 한정.
                 from menu_manager import _forced_shortcut_code
                 if sub_code and sub_code in main_menu_codes and sub_code != current_code:
                     if not (current_cl == "green" and _forced_shortcut_code(m.name)):
@@ -1086,6 +1097,13 @@ class MainFrame(wx.Frame):
             if text.lower() in {h.lower() for h in header_noise}:
                 _diag_lines.append(
                     f"  REJECT [header_noise] url={url!r} text={original_text!r}"
+                )
+                continue
+            # "동사무소" 가 포함된 텍스트(예: "소리샘 동사무소")는 모든 페이지에서
+            # 노이즈로 간주
+            if "동사무소" in text:
+                _diag_lines.append(
+                    f"  REJECT [contains_동사무소] url={url!r} text={original_text!r}"
                 )
                 continue
             if not text or len(text) < 2:
@@ -1120,7 +1138,46 @@ class MainFrame(wx.Frame):
             )
             num += 1
 
-        # 필터링 후 실제 항목이 없으면 "게시물이 없습니다" 표시
+        # 필터가 모든 항목을 거부했지만 원본 후보 목록은 있을 때:
+        # 사용자가 빈 화면을 보지 않도록, 자기 자신·헤더 노이즈만 걸러내고
+        # 나머지를 그대로 보여준다. (예: /?mo=prg, /?mo=potion 같은 카테고리
+        # 페이지에서 sub-link 들이 main_menu_codes 와 겹쳐 잘못 잘려나가는 경우)
+        if not filtered_subs and sub_menus:
+            display_items = ["0. 메인 메뉴로 돌아가기"]
+            seen_texts2: set[str] = set()
+            num2 = 1
+            from menu_manager import extract_shortcut_code as _esc
+            for m in sub_menus:
+                url = (m.url or "").strip()
+                if not url or url in ("/", "", "#") or url == source_url:
+                    continue
+                # 게시글 본문 링크는 하위 메뉴가 아님
+                if "wr_id=" in url.lower():
+                    continue
+                text = (m.display_text or "").strip()
+                # 번호 접두사 제거
+                text = re.sub(r"^\d+[\.\)]\s*", "", text).strip()
+                if not text or len(text) < 2 or len(text) > 60:
+                    continue
+                if text.lower() in {h.lower() for h in header_noise}:
+                    continue
+                if "동사무소" in text:
+                    continue
+                if text.lower() in seen_texts2:
+                    continue
+                seen_texts2.add(text.lower())
+                code = _esc(url) or ""
+                if code:
+                    display_items.append(f"{num2}. {text} (바로가기 코드: {code})")
+                else:
+                    display_items.append(f"{num2}. {text}")
+                filtered_subs.append(m)
+                _diag_lines.append(
+                    f"  RESCUE  url={url!r} text={text!r}"
+                )
+                num2 += 1
+
+        # 그래도 비어 있으면 안내 문구
         if not filtered_subs:
             display_items = ["0. 메인 메뉴로 돌아가기", "게시물이 없습니다."]
 
@@ -1233,6 +1290,49 @@ class MainFrame(wx.Frame):
                 self.status_bar.SetStatusText("준비", 0)
                 return
 
+            # 카테고리 랜딩 페이지(`/?mo=XXX`, bo_table·cl 없음) 인지 판정.
+            # 이런 페이지는 본문이나 게시글 목록이 아니라 동호회·섹션 링크
+            # 모음이므로, parse_board_list / parse_post_content 가 잘못 잡지
+            # 못하도록 하위 메뉴 흐름을 먼저 시도한다.
+            is_category_page = (
+                bool(re.search(r"[?&]mo=[a-zA-Z0-9_]+", board_url))
+                and "bo_table=" not in board_url
+                and "cl=" not in board_url
+            )
+
+            if is_category_page:
+                # 디버그 덤프 — 카테고리 페이지 HTML 을 data/ 에 저장해, 동호회 등이
+                # 빈 결과로 보일 때 사용자가 파일을 공유하면 셀렉터를 보강할 수 있다.
+                try:
+                    from config import DATA_DIR
+                    safe = re.sub(r"[^A-Za-z0-9]+", "_", board_url)[:40]
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(
+                        os.path.join(DATA_DIR, f"category_{safe}.html"),
+                        "w", encoding="utf-8",
+                    ) as _df:
+                        _df.write(html)
+                except Exception:
+                    pass
+
+                sub_menus = parse_sub_menus(html, base_url=board_url)
+                # parse_sub_menus 가 1~2개만 반환해도 fallback 을 합쳐 더 넓게.
+                fallback_links = self._extract_fallback_links(html)
+                # 합치되 중복 제거 (URL 기준)
+                merged: list = []
+                seen_urls: set[str] = set()
+                for item in list(sub_menus or []) + list(fallback_links or []):
+                    if item.url in seen_urls:
+                        continue
+                    seen_urls.add(item.url)
+                    merged.append(item)
+                if merged:
+                    self._show_sub_menu(merged, name, base_url=board_url)
+                    return
+                speak(f"{name}에 표시할 내용이 없습니다.")
+                self.status_bar.SetStatusText("준비", 0)
+                return
+
             # 1순위: 게시글 목록
             posts = parse_board_list(html)
             if posts:
@@ -1266,45 +1366,7 @@ class MainFrame(wx.Frame):
                 return
 
             # 4순위: 페이지의 모든 의미있는 링크를 하위메뉴로 표시
-            from bs4 import BeautifulSoup as _BS
-            _soup = _BS(html, "html.parser")
-
-            # script, style, footer, header 영역 제거
-            for tag in _soup.find_all(["script", "style", "footer"]):
-                tag.decompose()
-
-            fallback_menus = []
-            seen = set()
-            noise_texts = [
-                "본문으로", "상단으로", "로그아웃", "개인정보", "이용약관",
-                "돌아가기", "메일", "쪽지", "검색", "홈", "상단", "맨위",
-                "저작권", "copyright", "top", "skip",
-            ]
-            noise_hrefs = [
-                "login", "logout", "register", "memo.php", "formmail",
-                "mailto:", "password", "javascript:", "history.back",
-            ]
-            for a in _soup.find_all("a", href=True):
-                href = a.get("href", "").strip()
-                text = a.get_text(strip=True)
-                if not text or len(text) < 2 or len(text) > 60:
-                    continue
-                if href in ("#", ""):
-                    continue
-                if any(k in href.lower() for k in noise_hrefs):
-                    continue
-                if any(k in text for k in noise_texts):
-                    continue
-                if href.startswith("http") and SORISEM_BASE_URL not in href:
-                    # 외부 링크도 포함 (유튜브 등)
-                    pass
-                elif href.startswith("http"):
-                    href = href.replace(SORISEM_BASE_URL, "")
-
-                if href not in seen:
-                    seen.add(href)
-                    fallback_menus.append(SubMenuItem(text, href))
-
+            fallback_menus = self._extract_fallback_links(html)
             if fallback_menus:
                 self._show_sub_menu(fallback_menus, name, base_url=board_url)
                 return
@@ -1313,6 +1375,54 @@ class MainFrame(wx.Frame):
             self.status_bar.SetStatusText("준비", 0)
 
         self._fetch_page(url, on_loaded)
+
+    def _extract_fallback_links(self, html: str) -> list:
+        """페이지에서 노이즈를 제외한 의미 있는 모든 `<a>` 링크를 SubMenuItem
+        리스트로 반환. parse_sub_menus 의 셀렉터로 잡히지 않는 페이지(예:
+        /?mo=potion 같은 카테고리 랜딩) 에서 폴백으로 사용한다.
+        """
+        from bs4 import BeautifulSoup as _BS
+        from page_parser import SubMenuItem
+        _soup = _BS(html, "html.parser")
+        for tag in _soup.find_all(["script", "style", "footer"]):
+            tag.decompose()
+
+        noise_texts = [
+            "본문으로", "상단으로", "로그아웃", "개인정보", "이용약관",
+            "돌아가기", "메일", "쪽지", "검색", "홈", "상단", "맨위",
+            "저작권", "copyright", "top", "skip", "동사무소",
+        ]
+        noise_hrefs = [
+            "login", "logout", "register", "memo.php", "formmail",
+            "mailto:", "password", "javascript:", "history.back",
+        ]
+        out = []
+        seen = set()
+        for a in _soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            text = a.get_text(strip=True)
+            if not text or len(text) < 2 or len(text) > 60:
+                continue
+            if href in ("#", ""):
+                continue
+            href_lower = href.lower()
+            # 게시글 본문 링크는 하위 메뉴가 아니라 게시글 자체 — 제외.
+            # /?mo=potion 같은 카테고리 페이지가 보드로 리다이렉트되었을 때
+            # 게시글들이 하위 메뉴로 잘못 표시되는 문제 차단.
+            if "wr_id=" in href_lower:
+                continue
+            if any(k in href_lower for k in noise_hrefs):
+                continue
+            if any(k in text for k in noise_texts):
+                continue
+            if href.startswith("http") and SORISEM_BASE_URL not in href:
+                pass
+            elif href.startswith("http"):
+                href = href.replace(SORISEM_BASE_URL, "")
+            if href not in seen:
+                seen.add(href)
+                out.append(SubMenuItem(text, href))
+        return out
 
     # ── 키보드 이벤트 ──
 
@@ -3617,6 +3727,7 @@ class MainFrame(wx.Frame):
             "좌/우 방향키: 글자 단위 읽기",
             "Ctrl+좌/우: 단어 단위 읽기",
             "Shift+좌/우: 필드 단위 읽기 (번호/제목/작성자/날짜)",
+            "  · 메일함·쪽지함 목록에서도 동일 동작 (상태/보낸이/날짜/제목)",
             "Enter: 항목 선택/진입",
             "Backspace/ESC: 뒤로 가기",
             "Home: 첫 항목으로 이동",
@@ -3652,6 +3763,20 @@ class MainFrame(wx.Frame):
             "Alt+B: 이전 게시물",
             "Alt+N: 다음 게시물",
             "",
+            "=== 팝업(컨텍스트) 메뉴 — v1.6 추가 ===",
+            "메뉴 키 / Shift+F10 / 마우스 우클릭으로 상황별 메뉴 호출",
+            "  · 게시물 목록: 작성·수정·삭제·검색·새로고침",
+            "  · 게시물 본문: 본문 저장·첨부 저장·URL 목록·댓글 작성·",
+            "                 게시물 수정/삭제/답변·이전/다음 게시물",
+            "  · 댓글 목록: 댓글 작성·수정·삭제·정렬 순서 변경",
+            "  · 메일함/쪽지함: 새 글 쓰기·답장·읽기·삭제·새로고침",
+            "  · 메일/쪽지 보기: 답장·삭제·첨부 저장·본문 저장",
+            "(이동·페이지 탐색 등 내비게이션은 팝업에 포함하지 않음)",
+            "",
+            "=== 댓글 입력창 ===",
+            "Enter: 줄바꿈 추가",
+            "Ctrl+Enter: 댓글 등록 (확인)",
+            "",
             "=== 기타 ===",
             "Ctrl+J: 다운로드 상태",
             "Ctrl+K: 단축키 안내",
@@ -3669,6 +3794,7 @@ class MainFrame(wx.Frame):
             "",
             "=== 쪽지함·메일함 내부 ===",
             "↑/↓: 항목 이동",
+            "Shift+좌/우: 필드 순회 (상태·보낸이·날짜·제목)  — v1.6",
             "Enter: 쪽지/메일 열기",
             "D 또는 Delete: 선택 항목 삭제",
             "Shift+Delete: 현재 함 전체 비우기",
@@ -3678,17 +3804,20 @@ class MainFrame(wx.Frame):
             "PageDown/PageUp: 다음 페이지 누적 로드",
             "Alt+R / Alt+S: 받은함 / 보낸함 전환",
             "Alt+A: 모든 쪽지/메일 삭제",
+            "(목록 항목 앞에 \"안 읽음 / 읽음\" 상태가 표시됨 — v1.6)",
             "",
             "=== 쪽지·메일 보기 창 ===",
             "PageUp/PageDown, Alt+P/Alt+N: 이전/다음 항목",
             "R: 답장  D/Delete: 삭제  Esc: 닫기",
             "(메일) B: 본문 저장  Alt+S: 첨부 선택 저장  Alt+Shift+S: 모든 첨부 저장",
+            "(메일 보기 창 제목에 메일 제목 표시 — v1.6)",
             "",
             "=== 알림 센터 (Ctrl+Shift+N) ===",
             "Enter: 선택 항목 열기",
             "D 또는 Delete: 선택 알림 지우기",
             "A: 모든 알림 지우기",
             "F: 새로고침",
+            "(시작 시 자동으로 미확인 메일·쪽지 알림 — v1.6)",
             "",
             "=== 화면 설정 (저시력 지원) ===",
             "F7: 설정 창 열기 (테마·글꼴·사운드 통합)",
@@ -3697,6 +3826,15 @@ class MainFrame(wx.Frame):
             "Ctrl++: 글꼴 크게 (확대)",
             "Ctrl+-: 글꼴 작게 (축소)",
             "Ctrl+0: 글꼴 크기 원래대로",
+            "",
+            "=== v1.6 신규 기능 ===",
+            "· 단일 인스턴스 실행 (중복 실행 시 안내)",
+            "· 메일·쪽지 실시간 알림 \"즉시\"(1초) 옵션 — 기본값",
+            "· 시작 시 미확인 메일·쪽지 자동 안내",
+            "· 메일·쪽지 읽음 상태가 제목 표시줄·목록에 즉시 반영",
+            "· 사용자 편집 메뉴 파일(data/menu_list.txt) 지원",
+            "· 자동 메뉴 감지 — 사이트 메뉴 변경에 자동 대응",
+            "· 자동 업데이트 안정화 — GitHub API rate limit 시 HTML 폴백",
         ]
 
         dlg = wx.Dialog(self, title="단축키 안내", size=(450, 500),

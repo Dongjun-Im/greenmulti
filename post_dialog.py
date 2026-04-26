@@ -256,11 +256,10 @@ class PostDialog(wx.Dialog):
                 self.panel,
                 label=f"댓글 ({len(self.content.comments)}개):",
             )
-            # TextCtrl — 현재 선택된 댓글만 표시. 기존 ListBox와 비슷한 시각적
-            # 높이를 확보하기 위해 MULTILINE + 최소 높이. ItemTextCtrl이 Up/Down/
-            # Home/End/PageUp/Dn을 Windows 메시지 레벨에서 차단하므로 커서가 내부
-            # 줄 이동으로 빠질 걱정은 없다. 좌/우·Ctrl+좌/우만 TextCtrl 기본 동작 →
-            # 스크린리더가 글자/단어 단위로 자동 낭독한다.
+            # TextCtrl — 현재 선택된 댓글만 표시. MULTILINE + 최소 높이로
+            # 시각적 박스를 확보. 다줄 edit 컨트롤이 끝 가상 빈줄을 SR 에 알리는
+            # 문제는 SetValue 직후 SetInsertionPointEnd() 로 커서를 본문 마지막에
+            # 두어 회피한다. ItemTextCtrl 이 방향키를 차단하므로 커서 이동 걱정 없음.
             self.comment_ctrl = ItemTextCtrl(
                 self.panel,
                 style=wx.TE_READONLY | wx.TE_MULTILINE | wx.TE_DONTWRAP,
@@ -636,13 +635,14 @@ class PostDialog(wx.Dialog):
     def _restore_comment_display(self, display: str):
         """_jump_to_comment 에서 비웠던 댓글 내용을 화면에 다시 표시.
 
-        ChangeValue 를 써서 스크린리더 재낭독을 유발하지 않는다. 또 다줄
-        텍스트를 한 줄로 합쳐(`\\n` → ` · `) Windows 다줄 edit 컨트롤이 SR 에
-        끝빈줄("빈줄") 을 알리는 것을 막는다.
+        다줄 텍스트를 한 줄로 합쳐(`\\n` → ` · `) Windows 다줄 edit 컨트롤이
+        SR 에 가상 빈줄을 알리는 가능성을 줄이고, 커서를 본문 마지막에 두어
+        SR 가 그 다음을 빈 줄로 읽지 않도록 한다.
         """
         visual = re.sub(r"\n+", " · ", display).strip()
         self.comment_ctrl.ChangeValue(visual)
-        self.comment_ctrl.SetInsertionPoint(0)
+        # 커서를 텍스트 끝으로 — SR 가 cursor 뒤를 빈줄로 인식하지 않게.
+        self.comment_ctrl.SetInsertionPointEnd()
 
     def _update_comment_buttons(self):
         """현재 선택된 댓글의 수정/삭제 버튼 활성 상태 갱신."""
@@ -741,7 +741,8 @@ class PostDialog(wx.Dialog):
                 display_with_index[self._comment_index],
             ).strip()
             self.comment_ctrl.SetValue(visual)
-            self.comment_ctrl.SetInsertionPoint(0)
+            # 커서를 텍스트 끝으로 — SR 의 가상 빈줄 발화 회피.
+            self.comment_ctrl.SetInsertionPointEnd()
             self._update_comment_buttons()
         else:
             self._comment_index = 0
