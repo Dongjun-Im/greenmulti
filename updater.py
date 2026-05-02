@@ -210,12 +210,15 @@ def get_last_check_error() -> str:
 
 def check_latest_release(
     timeout: float = 10.0, channel: str = "stable",
+    use_cache: bool = True,
 ) -> Optional[ReleaseInfo]:
     """GitHub Releases 최신 릴리스 조회.
 
     channel="beta" 이면 pre-release 를 포함한 모든 릴리스 중 최신 버전을 반환.
-    네트워크 실패/비정상 응답은 모두 None (조용히 실패). 실패 원인은
-    get_last_check_error() 로 조회 가능.
+    use_cache=False 면 10분 TTL 캐시를 무시하고 항상 GitHub API 를 호출한다 —
+    "지금 업데이트 확인" 같은 사용자 명시적 액션에서 갓 나온 릴리스를 즉시
+    인지하기 위해 사용. 네트워크 실패/비정상 응답은 모두 None (조용히 실패).
+    실패 원인은 get_last_check_error() 로 조회 가능.
     """
     global _LAST_CHECK_ERROR
     _LAST_CHECK_ERROR = ""
@@ -223,10 +226,11 @@ def check_latest_release(
 
     # 1) 캐시(10분 TTL) 우선 — 짧은 시간 내 반복 호출은 GitHub API
     #    시간당 60회(IP 단위) 제한에 걸릴 수 있어 캐시로 회피한다.
-    cached = _load_cache(channel)
-    if cached is not None:
-        data = cached
-        return _build_release_info(data)
+    if use_cache:
+        cached = _load_cache(channel)
+        if cached is not None:
+            data = cached
+            return _build_release_info(data)
 
     try:
         if channel == "beta":

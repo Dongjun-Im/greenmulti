@@ -3950,12 +3950,17 @@ class MainFrame(wx.Frame):
         """실제 조회는 백그라운드 스레드에서.
 
         manual=True 이면 "최신 버전입니다" / 네트워크 실패 메시지도 표시.
-        manual=False 이면 새 버전 있을 때만 알림.
+        또한 사용자가 명시적으로 확인을 누른 경우이므로 10분 TTL 캐시를
+        무시하고 GitHub API 를 강제로 한 번 더 조회한다 — 갓 나온 릴리스를
+        놓치지 않기 위함.
+        manual=False 이면 새 버전 있을 때만 알림 + 캐시 사용.
         """
         channel = load_update_settings().get("channel", "stable")
 
         def worker():
-            info = check_latest_release(channel=channel)
+            info = check_latest_release(
+                channel=channel, use_cache=not manual,
+            )
             wx.CallAfter(self._on_update_check_done, info, manual)
 
         import threading

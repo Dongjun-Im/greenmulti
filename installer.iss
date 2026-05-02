@@ -2,7 +2,7 @@
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.7.0"
+#define AppVersion "1.7.1"
 #define AppVersionDisplay "v1.7"
 #define AppPublisher "초록등대 동호회"
 #define AppExeName "초록멀티 v1.7.exe"
@@ -105,9 +105,20 @@ Filename: "msiexec.exe"; \
   Flags: runhidden waituntilterminated; \
   Check: NeedWinFsp
 
+; 설치 완료 후 초록멀티 자동 실행. 일반 설치 모드에선 마법사 마지막의 "프로그램
+; 실행" 체크박스(postinstall) 로, /SILENT 자동 업데이트 모드에선 별도 [Run]
+; 항목으로 항상 실행되도록 분리. (skipifsilent 를 제거하면 /SILENT 시에도
+; 항상 launch 되어 자동 업데이트 후 끊김 없이 새 버전이 뜬다.)
 Filename: "{app}\{#AppExeName}"; \
   Description: "{cm:LaunchProgram,{#AppName} {#AppVersionDisplay}}"; \
   Flags: nowait postinstall skipifsilent
+
+; /SILENT 자동 업데이트 흐름에서 새 버전 자동 실행 — runasoriginaluser 로
+; 권한 상승 컨텍스트(UAC) 가 아닌 사용자 컨텍스트로 실행해 일반 사용자 권한
+; 환경에서도 새 인스턴스가 정상 시작되도록 한다.
+Filename: "{app}\{#AppExeName}"; \
+  Flags: nowait runasoriginaluser; \
+  Check: WizardSilent
 
 [Code]
 function NeedWinFsp(): Boolean;
