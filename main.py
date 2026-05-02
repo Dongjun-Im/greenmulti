@@ -40,6 +40,7 @@ class ChorokMultiApp(wx.App):
         self.session = authenticator.session
         self.user_id = authenticator.user_id
         self.user_nickname = authenticator.nickname
+        self.user_rank = getattr(authenticator, "rank", None)
 
         # 인증 성공: 메뉴 자동 감지 후 메인 윈도우 표시
         self._auto_detect_menus()
@@ -49,6 +50,7 @@ class ChorokMultiApp(wx.App):
             self.session,
             current_user_id=self.user_id,
             current_user_nickname=self.user_nickname,
+            current_user_rank=self.user_rank,
         )
         self.SetTopWindow(frame)
         return True

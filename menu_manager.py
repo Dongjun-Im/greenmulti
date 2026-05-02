@@ -52,6 +52,67 @@ FORCED_CLUB_MENUS: tuple[tuple[str, str], ...] = (
 )
 
 
+# 가상 하위 메뉴 매핑.
+# sorisem 응답이 비어 있거나 사이트 구조상 hub 페이지가 없는 메인 메뉴
+# 항목에 대해, 코드에서 직접 sub-item 목록을 정의한다. _load_and_show 가
+# 해당 URL 을 만나면 fetch 대신 이 목록을 그대로 sub-menu 로 표시한다.
+# (이름, url, type) 형식.
+VIRTUAL_SUBMENUS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    # 7. 전자도서관 — hub 가 빈 ul 을 응답해 직접 정의.
+    "/?mo=lib2013&cl=lib2013": (
+        ("1. 소설",        "/?mo=novs&cl=lib2013",                     "category"),
+        ("2. 시/에세이",   "/?mo=poes&cl=lib2013",                     "category"),
+        ("3. 경제 / 경영", "/bbs/board.php?bo_table=eco&cl=lib2013",   "board"),
+        ("4. 정치 / 사회", "/bbs/board.php?bo_table=soci&cl=lib2013",  "board"),
+        ("5. 인문",        "/bbs/board.php?bo_table=hum&cl=lib2013",   "board"),
+        ("6. 역사",        "/bbs/board.php?bo_table=his&cl=lib2013",   "board"),
+        ("7. 과학 / 기술 / IT", "/bbs/board.php?bo_table=sci&cl=lib2013", "board"),
+        ("8. 건강 / 심리", "/bbs/board.php?bo_table=hea&cl=lib2013",   "board"),
+        ("9. 국어 / 외국어", "/bbs/board.php?bo_table=lan&cl=lib2013", "board"),
+        ("10. 유아 / 어린이 / 청소년", "/bbs/board.php?bo_table=chi&cl=lib2013", "board"),
+        ("11. 종교",       "/bbs/board.php?bo_table=rel&cl=lib2013",    "board"),
+        ("12. 기타(예술, 대중문화, 가정, 취미)", "/bbs/board.php?bo_table=etcs&cl=lib2013", "board"),
+        ("55. 전자도서 신청란", "/bbs/board.php?bo_table=booksub2&cl=lib2013", "board"),
+        ("77. 공지사항",   "/bbs/board.php?bo_table=alllib4&cl=lib2013", "board"),
+        ("88. 전자도서 문의", "/bbs/board.php?bo_table=alllib5&cl=lib2013", "board"),
+        ("99. 전체자료실", "/bbs/board.php?bo_table=alllib99&cl=lib2013", "board"),
+    ),
+    # 7-1. 소설 — sub-category. 같은 hub URL 패턴이라 자동 파싱이 어려워
+    # 사용자가 알려준 항목을 직접 정의.
+    "/?mo=novs&cl=lib2013": (
+        ("1. 일반소설",     "/bbs/board.php?bo_table=aetcs&cl=lib2013",    "board"),
+        ("2. 로멘스",       "/bbs/board.php?bo_table=romances&cl=lib2013", "board"),
+        ("3. 무협 / 판타지", "/bbs/board.php?bo_table=chils&cl=lib2013",    "board"),
+        ("4. 추리 / 스릴러", "/bbs/board.php?bo_table=detes&cl=lib2013",    "board"),
+        ("5. 역사소설",     "/bbs/board.php?bo_table=wars&cl=lib2013",     "board"),
+    ),
+    # 7-2. 시/에세이 — sub-category.
+    "/?mo=poes&cl=lib2013": (
+        ("1. 시",     "/bbs/board.php?bo_table=poe&cl=lib2013",  "board"),
+        ("2. 에세이", "/bbs/board.php?bo_table=essa&cl=lib2013", "board"),
+    ),
+}
+
+
+# 표준 소리샘 메인 메뉴 — 자동 감지나 사용자 편집에서 빠지면 자동 보충.
+# (이름, url, type) 순서. 맨 앞 숫자 접두사가 정렬 기준.
+# v1.7 — 6.자료실, 7.전자도서관 의 URL 을 cl= 가 함께 있는 형태로 수정.
+# /?mo=pds 등 단독 mo URL 로는 sorisem 이 메인 사이드바만 응답해 빈 카테고리로 보였다.
+WELL_KNOWN_MAIN_MENUS: tuple[tuple[str, str, str], ...] = (
+    ("초록등대 동호회", "/plugin/ar.club/?cl=green", "club"),
+    ("1. 소리샘 공지사항", "/bbs/board.php?bo_table=sorisemnotice", "board"),
+    ("3. 개발자 포럼", "/?mo=prg", "category"),
+    ("4. 동호회", "/?mo=potion", "category"),
+    ("5. 잡지", "/?mo=magazin", "category"),
+    ("6. 자료실", "/?mo=pds&cl=pds", "category"),
+    # 7번 전자도서관 — sorisem 의 hub URL 이 빈 ul 을 응답해 자동 파싱 불가.
+    # VIRTUAL_SUBMENUS 에 정의된 가상 하위 메뉴를 사용한다.
+    ("7. 전자도서관", "/?mo=lib2013&cl=lib2013", "category"),
+    ("8. 노원시각장애인학습지원센터", "/?mo=edu2013&cl=edu2013", "category"),
+    ("9. 점자도서관", "/?mo=braille", "category"),
+)
+
+
 def _core_name(name: str) -> str:
     """메뉴 이름에서 앞쪽 번호 접두사(예: "4. ")와 공백을 제거한 핵심 이름.
 
@@ -171,6 +232,9 @@ class MenuManager:
             txt_menus = self._load_from_txt()
             if txt_menus:
                 self.menus = txt_menus
+                # 사용자 txt 에 빠진 표준 메뉴(예: 6.자료실, 7.전자도서관,
+                # 8.노원시각장애인학습지원센터) 가 있으면 자동 보충 + 정돈.
+                self._ensure_forced_club_menus()
                 # JSON 캐시도 동기화해 다른 코드 경로와 일관성 유지
                 try:
                     self.save()
@@ -248,7 +312,127 @@ class MenuManager:
                     m.name = new_name
                     changed = True
 
+        # 3) 표준 메인 메뉴 항목 자동 보충 — 사용자 편집·자동 감지에서 빠진
+        #    잘 알려진 항목(예: 6.자료실, 7.전자도서관, 8.노원시각장애인학습지원
+        #    센터)을 다시 채워 넣어 사용자가 사이트 기본 메뉴를 그대로 쓸 수 있게 한다.
+        existing_urls = {m.url for m in self.menus}
+        if self._supplement_well_known(existing_urls):
+            changed = True
+
+        # 4) 같은 이름으로 중복된 엔트리 제거. 예전 버전이 "6. 자료실" 을
+        #    "6. 소리샘 자료실" 로 이름 보정한 직후 supplement 가 새 URL
+        #    (/?mo=pds&cl=pds) 의 "6. 자료실" 을 추가했고, 다음 로딩에서 그것까지
+        #    "6. 소리샘 자료실" 로 다시 보정되어 동명 엔트리 두 개가 남는 사례가
+        #    발생했다. WELL_KNOWN URL 을 우선 보존, 없으면 마지막 항목을 남긴다.
+        from collections import OrderedDict
+        well_known_urls = {url for _n, url, _t in WELL_KNOWN_MAIN_MENUS}
+        by_name: OrderedDict[str, MenuItem] = OrderedDict()
+        for m in self.menus:
+            prev = by_name.get(m.name)
+            if prev is None:
+                by_name[m.name] = m
+                continue
+            # 동명 중복 — WELL_KNOWN 에 등록된 URL 을 우선 보존.
+            if m.url in well_known_urls and prev.url not in well_known_urls:
+                by_name[m.name] = m
+        if len(by_name) != len(self.menus):
+            self.menus = list(by_name.values())
+            changed = True
+
         return changed
+
+    @staticmethod
+    def _url_match_key(url: str) -> str:
+        """매뉴얼/자동감지 URL 을 동일성 비교용 정규화 형태로 변환.
+
+        sorisem 은 같은 카테고리를 두 가지 URL 로 노출한다:
+          · 자동감지 결과: `/?mo=pds`
+          · WELL_KNOWN: `/?mo=pds&cl=pds`
+        둘 다 동일한 자료실인데 supplement 가 별개로 인식해 중복 엔트리를
+        만드는 문제가 있었다. mo= 값과 board.php 의 bo_table 값을 키로 추출해
+        같은 카테고리·게시판이면 같은 키를 갖도록 한다.
+        """
+        if not url:
+            return ""
+        u = url.lower().strip()
+        m_mo = re.search(r"[?&]mo=([a-z0-9_]+)", u)
+        if m_mo:
+            return f"mo={m_mo.group(1)}"
+        m_bo = re.search(r"[?&]bo_table=([a-z0-9_]+)", u)
+        if m_bo:
+            return f"bo={m_bo.group(1)}"
+        return u
+
+    def _supplement_well_known(self, existing_urls: set[str]) -> bool:
+        """`WELL_KNOWN_MAIN_MENUS` 중 self.menus 에 빠진 항목을
+        번호 순서대로 적절한 위치에 끼워 넣는다.
+
+        매칭 우선순위:
+          · 같은 이름(번호 접두사 포함) 의 항목이 이미 있으면 URL 만 갱신.
+          · URL 정규화 키(예: mo=pds) 가 같은 항목이 있으면 URL 갱신만 하고
+            새로 추가하지 않음 — 자동감지 `/?mo=pds` 와 WELL_KNOWN
+            `/?mo=pds&cl=pds` 같은 중복 인식 문제 방지.
+          · 같은 URL 이 이미 있으면 건너뜀.
+          · 위 어느 매칭도 없을 때만 새로 삽입.
+
+        반환: 실제로 변경(추가·URL 갱신) 이 있었는지 여부.
+        """
+        changed = False
+        existing_by_name: dict[str, MenuItem] = {}
+        existing_by_key: dict[str, MenuItem] = {}
+        for m in self.menus:
+            existing_by_name[m.name] = m
+            key = self._url_match_key(m.url)
+            if key and key not in existing_by_key:
+                existing_by_key[key] = m
+        for name, url, mtype in WELL_KNOWN_MAIN_MENUS:
+            existing = existing_by_name.get(name)
+            if existing is not None:
+                if existing.url != url:
+                    existing.url = url
+                    existing.type = mtype
+                    changed = True
+                continue
+            # URL 정규화 키 매칭 — 자동감지가 다른 이름으로 같은 카테고리를
+            # 등록한 경우(예: "6. 소리샘 자료실" /?mo=pds) WELL_KNOWN URL
+            # (/?mo=pds&cl=pds) 으로 보정만 하고 새 엔트리 추가는 막는다.
+            key = self._url_match_key(url)
+            existing_by_key_match = existing_by_key.get(key) if key else None
+            if existing_by_key_match is not None:
+                if existing_by_key_match.url != url:
+                    existing_by_key_match.url = url
+                    existing_by_key_match.type = mtype
+                    changed = True
+                continue
+            if url in existing_urls:
+                continue
+            new_item = MenuItem(name=name, url=url, menu_type=mtype)
+            insert_at = self._find_insert_index(name)
+            self.menus.insert(insert_at, new_item)
+            existing_urls.add(url)
+            existing_by_name[name] = new_item
+            if key:
+                existing_by_key[key] = new_item
+            changed = True
+        return changed
+
+    def _find_insert_index(self, name: str) -> int:
+        """이름의 숫자 접두사를 보고 self.menus 의 정렬을 유지하는 위치를 찾는다.
+
+        숫자 접두사가 없으면 끝에 추가.
+        """
+        m = re.match(r'^\s*(\d+)[\.\)]\s*', name or "")
+        if not m:
+            return len(self.menus)
+        my_num = int(m.group(1))
+        for idx, mi in enumerate(self.menus):
+            mm = re.match(r'^\s*(\d+)[\.\)]\s*', mi.name or "")
+            if not mm:
+                continue
+            other_num = int(mm.group(1))
+            if my_num < other_num:
+                return idx
+        return len(self.menus)
 
     def save(self) -> None:
         data = {

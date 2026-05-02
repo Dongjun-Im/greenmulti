@@ -26,8 +26,34 @@ class Authenticator:
 
     def __init__(self):
         self.session = requests.Session()
+        # 브라우저(Chrome) 와 거의 동일한 헤더 세트.
+        # sorisem(gnuboard) 의 일부 게시판은 권한 체크 시 봇 검출을 위해
+        # Accept / Accept-Language 등 표준 헤더 유무를 본다. 누락 시 로그인은
+        # 되어도 board.php 호출에서 "접근권한이 없습니다.(10000)" 응답이 오는
+        # 사례가 발견되어, 가능한 한 브라우저 요청과 똑같이 맞춘다.
         self.session.headers.update({
-            "User-Agent": "ChorokMulti/1.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate",
+            "Cache-Control": "max-age=0",
+            "Sec-Ch-Ua": '"Chromium";v="120", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Connection": "keep-alive",
         })
 
     def authenticate(self, user_id: str, password: str) -> AuthResult:

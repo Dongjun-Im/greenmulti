@@ -57,10 +57,13 @@ def send_mail(session: requests.Session,
               recipient: str,
               subject: str,
               body: str,
-              recipient_is_userid: bool = True) -> tuple[bool, str]:
+              recipient_is_userid: bool = True,
+              attachments: list[str] | None = None) -> tuple[bool, str]:
     """메일 발송. gnuboard5 formmail → formmail_send 흐름.
 
     recipient_is_userid=True 이면 소리샘 회원 ID(mb_id). False 이면 이메일 주소 직접.
+    attachments: 첨부할 파일 경로 리스트. 폼이 file input 을 가지고 있으면
+        multipart/form-data 로 함께 전송한다. 없으면 첨부 무시.
     """
     # 1. 폼 GET — mb_id 파라미터가 있으면 수신자 이메일이 자동 채워짐
     params = {"mb_id": recipient} if recipient_is_userid else {"email": recipient}
@@ -81,11 +84,16 @@ def send_mail(session: requests.Session,
         return False, "메일 작성 폼 구조를 인식하지 못했습니다."
 
     data = {}
+    file_field_names: list[str] = []
     for inp in form.find_all("input"):
         name = inp.get("name")
         if not name:
             continue
-        if inp.get("type") == "submit":
+        itype = (inp.get("type") or "").lower()
+        if itype == "submit":
+            continue
+        if itype == "file":
+            file_field_names.append(name)
             continue
         data[name] = inp.get("value", "")
     for ta in form.find_all("textarea"):
@@ -103,10 +111,41 @@ def send_mail(session: requests.Session,
 
     action = form.get("action") or MAIL_SEND_URL
     post_url = urljoin(form_resp.url, action)
+
+    # 첨부파일 처리: 폼에 file input 이 있으면 multipart 로 같이 전송
+    files_payload = []
+    open_handles = []
+    if attachments:
+        # file 필드명이 없는 경우의 폴백 후보 (gnuboard5 자주 쓰는 이름)
+        candidates = file_field_names or ["bf_file[]", "bf_file", "files[]", "file"]
+        for idx, path in enumerate(attachments):
+            try:
+                fh = open(path, "rb")
+            except OSError:
+                continue
+            open_handles.append(fh)
+            field_name = candidates[idx] if idx < len(candidates) else candidates[-1]
+            import os as _os
+            files_payload.append(
+                (field_name, (_os.path.basename(path), fh, "application/octet-stream"))
+            )
+
     try:
-        resp = session.post(post_url, data=data, timeout=30, allow_redirects=True)
+        if files_payload:
+            resp = session.post(
+                post_url, data=data, files=files_payload,
+                timeout=120, allow_redirects=True,
+            )
+        else:
+            resp = session.post(post_url, data=data, timeout=30, allow_redirects=True)
     except requests.RequestException as e:
         return False, f"전송 실패: {e}"
+    finally:
+        for fh in open_handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}"
@@ -132,10 +171,11 @@ class MailWriteDialog(wx.Dialog):
                  default_subject: str = "",
                  default_body: str = ""):
         title = "관리자에게 메일 보내기" if mode == self.MODE_ADMIN else "메일 보내기"
-        super().__init__(parent, title=title, size=(680, 520),
+        super().__init__(parent, title=title, size=(720, 600),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.session = session
         self.mode = mode
+        self.attachment_paths: list[str] = []
 
         # 관리자 모드면 수신자 고정(표시만, 편집 불가)
         if mode == self.MODE_ADMIN:
@@ -145,7 +185,10 @@ class MailWriteDialog(wx.Dialog):
         vbox = wx.BoxSizer(wx.VERTICAL)
 
         # 수신자
-        lbl_r = wx.StaticText(panel, label="받는 사람 (소리샘 아이디 또는 이메일 주소)")
+        if mode == self.MODE_ADMIN:
+            lbl_r = wx.StaticText(panel, label="받는 사람 (관리자, 변경 불가)")
+        else:
+            lbl_r = wx.StaticText(panel, label="받는 사람 (소리샘 아이디 또는 이메일 주소)")
         vbox.Add(lbl_r, 0, wx.TOP | wx.LEFT | wx.RIGHT, 8)
         self.recipient_ctrl = wx.TextCtrl(panel, value=default_recipient)
         if mode == self.MODE_ADMIN:
@@ -165,7 +208,22 @@ class MailWriteDialog(wx.Dialog):
                                      style=wx.TE_MULTILINE | wx.TE_RICH2)
         vbox.Add(self.body_ctrl, 1, wx.ALL | wx.EXPAND, 8)
 
-        # 버튼
+        # 첨부파일 영역 — MailComposeDialog 와 동일한 UI
+        atc_label = wx.StaticText(panel, label="첨부파일 (Alt+F 추가 / Del 삭제)")
+        vbox.Add(atc_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.attach_list = wx.ListBox(panel, choices=[], style=wx.LB_SINGLE)
+        self.attach_list.SetMinSize((-1, 80))
+        vbox.Add(self.attach_list, 0, wx.ALL | wx.EXPAND, 8)
+        atc_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.add_file_btn = wx.Button(panel, label="파일 추가(&F)")
+        self.add_file_btn.Bind(wx.EVT_BUTTON, self.on_add_files)
+        atc_btn_sizer.Add(self.add_file_btn, 0, wx.RIGHT, 8)
+        self.remove_file_btn = wx.Button(panel, label="선택 파일 제거(&R)")
+        self.remove_file_btn.Bind(wx.EVT_BUTTON, self.on_remove_file)
+        atc_btn_sizer.Add(self.remove_file_btn, 0)
+        vbox.Add(atc_btn_sizer, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # 전송/취소 버튼
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.send_btn = wx.Button(panel, label="보내기(&S)")
         self.send_btn.Bind(wx.EVT_BUTTON, self.on_send)
@@ -187,13 +245,62 @@ class MailWriteDialog(wx.Dialog):
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
+        mods = event.HasModifiers()
         if key == wx.WXK_ESCAPE:
             self.EndModal(wx.ID_CANCEL)
             return
-        if key == ord("S") and event.ControlDown():
+        if key == ord("S") and event.ControlDown() and not event.AltDown():
             self.on_send(None)
             return
+        # Alt+F — 파일 추가
+        if key == ord("F") and event.AltDown() and not event.ControlDown():
+            self.on_add_files(None)
+            return
+        # 첨부 리스트박스에서 Del/D 로 선택 파일 제거
+        focused = self.FindFocus()
+        if focused is self.attach_list and not mods:
+            if key in (wx.WXK_DELETE, ord("D")):
+                self.on_remove_file(None)
+                return
         event.Skip()
+
+    def on_add_files(self, event):
+        """wx.FileDialog 로 파일 선택 (다중 선택 허용) → 첨부 목록에 추가."""
+        dlg = wx.FileDialog(
+            self, "첨부할 파일 선택",
+            wildcard="모든 파일 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            import os as _os
+            paths = dlg.GetPaths()
+            for p in paths:
+                if p in self.attachment_paths:
+                    continue
+                self.attachment_paths.append(p)
+                size = ""
+                try:
+                    n = _os.path.getsize(p)
+                    size = f" ({_format_size(n)})"
+                except OSError:
+                    pass
+                self.attach_list.Append(f"{_os.path.basename(p)}{size}")
+            speak(f"첨부파일 {len(paths)}개 추가됨. 총 {len(self.attachment_paths)}개.")
+        finally:
+            dlg.Destroy()
+
+    def on_remove_file(self, event):
+        sel = self.attach_list.GetSelection()
+        if sel == wx.NOT_FOUND:
+            speak("제거할 첨부파일을 선택해 주세요.")
+            return
+        del self.attachment_paths[sel]
+        self.attach_list.Delete(sel)
+        speak("첨부파일 제거됨.")
+        if self.attach_list.GetCount() > 0:
+            self.attach_list.SetSelection(min(sel, self.attach_list.GetCount() - 1))
 
     def on_send(self, event):
         recipient = self.recipient_ctrl.GetValue().strip()
@@ -216,12 +323,28 @@ class MailWriteDialog(wx.Dialog):
             self.body_ctrl.SetFocus()
             return
 
-        # 이메일 주소 vs 아이디 판별
         is_email = "@" in recipient
-        speak("메일을 보내는 중입니다.")
+
+        # 외부 이메일(@포함) → 소리샘은 외부 메일 발송을 막아 두었기 때문에
+        # 사용자의 기본 메일 프로그램(mailto:) 으로 열어 보낸다.
+        # 본문은 클립보드에도 복사해 길이 제한·인코딩 문제를 피하고, 첨부파일이
+        # 있으면 mailto: 가 자동 첨부를 지원하지 않으므로 안내 후 경로를 같이
+        # 클립보드에 넣어 사용자가 직접 첨부할 수 있도록 한다.
+        if is_email:
+            self._send_via_default_mail_client(recipient, subject, body)
+            return
+
+        # 소리샘 내부 회원 ID(@없음) — formmail 흐름으로 정상 전송
+        if self.attachment_paths:
+            speak(f"첨부파일 {len(self.attachment_paths)}개와 함께 메일을 보냅니다.")
+        else:
+            speak("메일을 보내는 중입니다.")
         self.send_btn.Disable()
-        ok, msg = send_mail(self.session, recipient, subject, body,
-                            recipient_is_userid=not is_email)
+        ok, msg = send_mail(
+            self.session, recipient, subject, body,
+            recipient_is_userid=True,
+            attachments=self.attachment_paths or None,
+        )
         self.send_btn.Enable()
 
         if ok:
@@ -233,6 +356,98 @@ class MailWriteDialog(wx.Dialog):
             speak("메일 전송에 실패했습니다.")
             wx.MessageBox(f"메일 전송에 실패했습니다.\n{msg}",
                           "전송 실패", wx.OK | wx.ICON_ERROR, self)
+
+    def _send_via_default_mail_client(
+        self, recipient: str, subject: str, body: str,
+    ) -> None:
+        """기본 메일 프로그램을 열어 사용자가 직접 발송하도록 안내.
+
+        소리샘은 외부 이메일 발송을 차단하므로 외부 주소(예: 관리자 gmail) 로
+        메일을 보내려면 사용자의 PC 메일 프로그램을 거쳐야 한다.
+
+        mailto: 의 ?subject=...&body=... 쿼리는 일부 한국어 메일 클라이언트가
+        잘못 해석해 받는사람 칸에 query 문자열이 그대로 들어가는 문제가
+        있어서, mailto 에는 받는사람만 넣고 제목·본문·첨부 경로는 클립보드로
+        전달해 사용자가 붙여넣어 작성하도록 한다.
+        """
+        import os as _os, sys as _sys
+
+        # 클립보드에 제목·본문·첨부 경로를 정리해서 한 번에 복사
+        clip_lines = [f"제목: {subject}", "", body]
+        if self.attachment_paths:
+            clip_lines.append("")
+            clip_lines.append("--- 첨부할 파일 경로 ---")
+            clip_lines.extend(self.attachment_paths)
+        try:
+            if wx.TheClipboard.Open():
+                wx.TheClipboard.SetData(wx.TextDataObject("\n".join(clip_lines)))
+                wx.TheClipboard.Close()
+        except Exception:
+            pass
+
+        # 기본 메일 프로그램 실행 — 받는 사람만 mailto: 에 포함
+        # Windows 는 os.startfile 로 ShellExecute 호출 (등록된 mailto 핸들러).
+        # 다른 OS 는 webbrowser.open 으로 폴백.
+        opened = False
+        mailto_url = f"mailto:{recipient}"
+        try:
+            if _sys.platform.startswith("win"):
+                _os.startfile(mailto_url)
+                opened = True
+            else:
+                import webbrowser
+                webbrowser.open(mailto_url)
+                opened = True
+        except OSError as e:
+            try:
+                import webbrowser
+                webbrowser.open(mailto_url)
+                opened = True
+            except Exception:
+                speak("메일 프로그램을 열 수 없습니다.")
+                wx.MessageBox(
+                    f"기본 메일 프로그램을 열 수 없습니다.\n{e}\n\n"
+                    "받는 사람·제목·본문·첨부 경로가 모두 클립보드에 복사되어 "
+                    "있으니, 사용하시는 메일 서비스에서 직접 붙여 넣어 보내주세요.\n\n"
+                    f"받는 사람: {recipient}",
+                    "메일 프로그램 실행 실패", wx.OK | wx.ICON_ERROR, self,
+                )
+                return
+        except Exception as e:
+            speak("메일 프로그램을 열 수 없습니다.")
+            wx.MessageBox(
+                f"기본 메일 프로그램을 열 수 없습니다.\n{e}\n\n"
+                f"받는 사람: {recipient}\n"
+                "제목·본문·첨부 경로는 클립보드에 복사되어 있습니다.",
+                "메일 프로그램 실행 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+
+        # 안내 메시지 — 사용자에게 무엇을 해야 하는지 명확히
+        if self.attachment_paths:
+            tip = (
+                f"기본 메일 프로그램을 열었습니다. 받는 사람은 {recipient} 으로 "
+                "자동 입력되어 있습니다.\n\n"
+                "소리샘은 외부 이메일 발송을 막아 두었기 때문에, 메일 프로그램에서 "
+                "직접 보내 주셔야 전달됩니다.\n\n"
+                "제목·본문·첨부 경로가 클립보드에 한꺼번에 복사되어 있으니, "
+                "메일 프로그램에서 붙여넣기(Ctrl+V) 로 작성하시고, 첨부할 파일은 "
+                f"{len(self.attachment_paths)}개의 경로를 보고 첨부 버튼으로 "
+                "직접 추가해 주세요."
+            )
+        else:
+            tip = (
+                f"기본 메일 프로그램을 열었습니다. 받는 사람은 {recipient} 으로 "
+                "자동 입력되어 있습니다.\n\n"
+                "소리샘은 외부 이메일 발송을 막아 두었기 때문에, 메일 프로그램에서 "
+                "직접 보내 주셔야 전달됩니다.\n\n"
+                "제목과 본문이 클립보드에 복사되어 있으니, 메일 프로그램에서 "
+                "붙여넣기(Ctrl+V) 로 작성하시면 됩니다."
+            )
+        speak("메일 프로그램을 열었습니다. 직접 보내 주세요.")
+        wx.MessageBox(tip, "기본 메일 프로그램으로 보내기",
+                      wx.OK | wx.ICON_INFORMATION, self)
+        self.EndModal(wx.ID_OK)
 
 
 def _dump_mail_debug(html: str, tag: str) -> str:

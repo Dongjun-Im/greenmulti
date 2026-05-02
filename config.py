@@ -3,13 +3,13 @@ import os
 import sys
 
 # 앱 정보
-APP_NAME = "초록멀티 v1.6"
-APP_VERSION = "1.6.6"
-APP_BUILD_DATE = "2026-04-26"
+APP_NAME = "초록멀티 v1.7"
+APP_VERSION = "1.7.0"
+APP_BUILD_DATE = "2026-05-02"
 APP_AUTHOR = "임동준"
-APP_EMAIL = "d.june0503@gmail.com"
+APP_EMAIL = "greenlightsori@gmail.com"
 APP_ADMIN_EMAIL = "greenlightsori@gmail.com"
-APP_COPYRIGHT = "\u00A9 2026 초록등대 동호회. All rights reserved."
+APP_COPYRIGHT = "Copyright\u24D2 2026 초록등대 동호회. All rights reserved."
 
 # 경로
 if getattr(sys, 'frozen', False):
@@ -36,6 +36,11 @@ MENU_LIST_FILE = os.path.join(DATA_DIR, "menu_list.json")
 # 사용자가 직접 편집할 수 있는 텍스트 메뉴 파일. 존재하면 자동 감지 결과를
 # 덮어쓴다. 포맷은 한 줄에 "이름 | URL | 타입" (타입은 선택).
 MENU_LIST_TXT_FILE = os.path.join(DATA_DIR, "menu_list.txt")
+
+# v1.7 — 즐겨찾기 / 답장 템플릿 / 게시판 구독
+BOOKMARKS_FILE = os.path.join(DATA_DIR, "bookmarks.json")
+REPLY_TEMPLATES_FILE = os.path.join(DATA_DIR, "reply_templates.txt")
+SUBSCRIPTIONS_FILE = os.path.join(DATA_DIR, "subscriptions.json")
 
 # 소리샘 URL
 SORISEM_BASE_URL = "https://www.sorisem.net"

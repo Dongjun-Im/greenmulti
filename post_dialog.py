@@ -143,11 +143,39 @@ class CommentDialog(wx.Dialog):
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
 
     def _on_char_hook(self, event):
-        if event.GetKeyCode() == wx.WXK_RETURN and event.ControlDown():
+        key = event.GetKeyCode()
+        if key == wx.WXK_RETURN and event.ControlDown():
             if self.IsModal():
                 self.EndModal(wx.ID_OK)
             return
+        # v1.7 — Alt+1..9 로 빠른 답장 템플릿 삽입
+        if event.AltDown() and not event.ControlDown() and not event.ShiftDown():
+            if ord("1") <= key <= ord("9"):
+                self._insert_template(key - ord("0"))
+                return
+            # 메인 키패드 외 NumPad1..9 도 지원
+            if wx.WXK_NUMPAD1 <= key <= wx.WXK_NUMPAD9:
+                self._insert_template(key - wx.WXK_NUMPAD0)
+                return
         event.Skip()
+
+    def _insert_template(self, index: int) -> None:
+        """답장 템플릿 N번 (1~9) 을 커서 위치에 삽입."""
+        try:
+            from reply_templates import get_template
+            text = get_template(index)
+        except Exception:
+            text = ""
+        if not text:
+            speak(f"{index}번 템플릿이 비어 있습니다.")
+            return
+        # 현재 커서 위치에 삽입
+        ctrl = self.comment_text
+        try:
+            ctrl.WriteText(text)
+        except Exception:
+            ctrl.AppendText(text)
+        speak(f"템플릿 {index}번 삽입.")
 
     def get_text(self) -> str:
         return self.comment_text.GetValue().strip()
@@ -488,14 +516,17 @@ class PostDialog(wx.Dialog):
                 self.on_edit_comment()
                 return
 
-        # 댓글 목록 TextCtrl: 위/아래 → 댓글 이동, Home/End → 처음/끝 댓글.
+        # 댓글 목록 TextCtrl: 위/아래·PgUp/PgDn → 댓글 이동, Home/End → 처음/끝 댓글.
         # 좌/우·Ctrl+좌/우는 TextCtrl 기본 동작(글자/단어 이동)이 스크린리더 낭독을
         # 자동으로 발생시키므로 별도 처리하지 않고 event.Skip() 으로 흘려보낸다.
+        # PgUp/PgDn 추가 — 일부 환경(특정 스크린리더·키보드 후크) 에서 Up/Down
+        # 이 댓글 컨트롤로 도달하지 못해 PgUp/PgDn 으로 이동하던 사용자가 있어
+        # 두 키 모두 동일하게 동작하도록 묶었다.
         if self.has_comments and focused == self.comment_ctrl and not alt and not ctrl:
-            if keycode == wx.WXK_UP:
+            if keycode in (wx.WXK_UP, wx.WXK_PAGEUP):
                 self._jump_to_comment(self._comment_index - 1)
                 return
-            if keycode == wx.WXK_DOWN:
+            if keycode in (wx.WXK_DOWN, wx.WXK_PAGEDOWN):
                 self._jump_to_comment(self._comment_index + 1)
                 return
             if keycode == wx.WXK_HOME:
@@ -636,13 +667,14 @@ class PostDialog(wx.Dialog):
         """_jump_to_comment 에서 비웠던 댓글 내용을 화면에 다시 표시.
 
         다줄 텍스트를 한 줄로 합쳐(`\\n` → ` · `) Windows 다줄 edit 컨트롤이
-        SR 에 가상 빈줄을 알리는 가능성을 줄이고, 커서를 본문 마지막에 두어
-        SR 가 그 다음을 빈 줄로 읽지 않도록 한다.
+        SR 에 가상 빈줄을 알리는 가능성을 줄이고, 커서를 본문 시작점에 두어
+        Ctrl+→ 가 단어 단위 정방향으로 자연스럽게 이동하도록 한다.
+        (이전엔 끝으로 두어 Ctrl+→ 가 동작하지 않고 Ctrl+← 만 역순으로 동작하던
+        문제가 있었다. 한 줄 텍스트라 끝빈줄 발화 우려는 없음.)
         """
         visual = re.sub(r"\n+", " · ", display).strip()
         self.comment_ctrl.ChangeValue(visual)
-        # 커서를 텍스트 끝으로 — SR 가 cursor 뒤를 빈줄로 인식하지 않게.
-        self.comment_ctrl.SetInsertionPointEnd()
+        self.comment_ctrl.SetInsertionPoint(0)
 
     def _update_comment_buttons(self):
         """현재 선택된 댓글의 수정/삭제 버튼 활성 상태 갱신."""
@@ -741,8 +773,9 @@ class PostDialog(wx.Dialog):
                 display_with_index[self._comment_index],
             ).strip()
             self.comment_ctrl.SetValue(visual)
-            # 커서를 텍스트 끝으로 — SR 의 가상 빈줄 발화 회피.
-            self.comment_ctrl.SetInsertionPointEnd()
+            # 커서를 텍스트 시작점에 — Ctrl+→ 단어 단위 정방향 이동을 위해.
+            # (한 줄 텍스트라 끝빈줄 발화 문제 없음.)
+            self.comment_ctrl.SetInsertionPoint(0)
             self._update_comment_buttons()
         else:
             self._comment_index = 0
@@ -881,6 +914,8 @@ class PostDialog(wx.Dialog):
                     dl_entry["status"] = "완료"
                     _beep(1200)  # 완료음
                     success += 1
+                    # v1.7 — DAISY 도서 ZIP 자동 감지·변환 안내
+                    self._maybe_offer_daisy(save_path)
                 except Exception:
                     dl_entry["status"] = "실패"
                     fail += 1
@@ -896,6 +931,53 @@ class PostDialog(wx.Dialog):
                     pass
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _maybe_offer_daisy(self, file_path: str) -> None:
+        """다운로드된 파일이 DAISY ZIP 이면 변환을 제안 (v1.7)."""
+        try:
+            from daisy import is_daisy_zip, convert_zip_to_text
+        except Exception:
+            return
+        if not is_daisy_zip(file_path):
+            return
+
+        def ui():
+            ans = wx.MessageBox(
+                f"내려받은 파일이 DAISY 도서로 보입니다.\n\n"
+                f"{os.path.basename(file_path)}\n\n"
+                "압축을 풀고 본문을 TXT 로 변환할까요?",
+                "DAISY 도서 변환",
+                wx.YES_NO | wx.ICON_QUESTION,
+            )
+            if ans != wx.YES:
+                return
+            try:
+                result = convert_zip_to_text(file_path)
+            except Exception as e:
+                wx.MessageBox(f"DAISY 변환 실패: {e}", "오류",
+                              wx.OK | wx.ICON_ERROR)
+                return
+            if result is None:
+                wx.MessageBox(
+                    "본문 XML 을 찾지 못해 변환에 실패했습니다.",
+                    "변환 실패", wx.OK | wx.ICON_ERROR,
+                )
+                return
+            folder, txt_path = result
+            speak(f"DAISY 도서를 텍스트로 변환했습니다.")
+            ans2 = wx.MessageBox(
+                f"DAISY 도서 변환 완료.\n\n"
+                f"폴더: {folder}\n파일: {txt_path}\n\n"
+                "폴더를 탐색기로 열까요?",
+                "변환 완료", wx.YES_NO | wx.ICON_INFORMATION,
+            )
+            if ans2 == wx.YES:
+                try:
+                    os.startfile(folder)
+                except Exception:
+                    pass
+
+        wx.CallAfter(ui)
 
     # ── 댓글 작성 ──
 
@@ -1351,9 +1433,11 @@ class PostDialog(wx.Dialog):
 
     def _show_edit_dialog(self, old_title: str, old_body: str):
         from write_dialog import WriteDialog
+        parent_rank = getattr(self.GetParent(), "current_user_rank", None)
         dialog = WriteDialog(
             self, self.session, self.content.bo_table,
             existing_title=old_title, existing_body=old_body,
+            user_rank=parent_rank,
         )
         dialog._edit_wr_id = self.content.wr_id
 
@@ -1497,7 +1581,11 @@ class PostDialog(wx.Dialog):
             return
 
         from write_dialog import WriteDialog
-        dialog = WriteDialog(self, self.session, self.content.bo_table)
+        parent_rank = getattr(self.GetParent(), "current_user_rank", None)
+        dialog = WriteDialog(
+            self, self.session, self.content.bo_table,
+            user_rank=parent_rank,
+        )
         dialog.SetTitle("게시물 답변")
         dialog.submit_btn.SetLabel("답변 등록(&W)")
         # 답변 모드: w=r, wr_id 설정

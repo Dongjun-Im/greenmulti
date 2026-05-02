@@ -295,6 +295,9 @@ def load_notify_settings() -> dict:
         "check_memo": True,
         "check_mail": True,
         "list_page_size": 10,
+        # v1.7 — 게시판 구독 알림 주기. 빠른 반영을 위해 기본 10초.
+        "subscription_interval_sec": 10,
+        "check_subscriptions": True,
     }
     if not os.path.exists(MEMO_NOTIFY_SETTINGS_FILE):
         return defaults
@@ -309,9 +312,14 @@ def load_notify_settings() -> dict:
             defaults["check_mail"] = bool(data.get("check_mail", True))
             size = int(data.get("list_page_size", 10))
             if size not in LIST_PAGE_SIZE_OPTIONS:
-                # 가장 가까운 값으로
                 size = min(LIST_PAGE_SIZE_OPTIONS, key=lambda x: abs(x - size))
             defaults["list_page_size"] = size
+            defaults["subscription_interval_sec"] = int(
+                data.get("subscription_interval_sec", 10)
+            )
+            defaults["check_subscriptions"] = bool(
+                data.get("check_subscriptions", True)
+            )
     except Exception:
         pass
     return defaults
@@ -329,6 +337,12 @@ def save_notify_settings(settings: dict) -> None:
             "check_memo": bool(settings.get("check_memo", True)),
             "check_mail": bool(settings.get("check_mail", True)),
             "list_page_size": int(settings.get("list_page_size", 10)),
+            "subscription_interval_sec": int(
+                settings.get("subscription_interval_sec", 10)
+            ),
+            "check_subscriptions": bool(
+                settings.get("check_subscriptions", True)
+            ),
         }
         with open(MEMO_NOTIFY_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(cleaned, f, ensure_ascii=False, indent=2)
@@ -376,6 +390,28 @@ class NotifyPage(wx.Panel):
         self.cb_mail.SetValue(bool(self.settings.get("check_mail", True)))
         vbox.Add(self.cb_mail, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
+        # v1.7 — 게시판 구독 알림 주기 + 사용 여부
+        self.subscription_rb = wx.RadioBox(
+            self, label="게시판 구독 알림 주기(&S)",
+            choices=labels,
+            majorDimension=1, style=wx.RA_SPECIFY_COLS,
+        )
+        sub_cur = int(self.settings.get("subscription_interval_sec", 10))
+        try:
+            sub_idx = self._interval_values.index(sub_cur)
+        except ValueError:
+            # 가장 가까운 값으로
+            try:
+                sub_idx = self._interval_values.index(10)
+            except ValueError:
+                sub_idx = 0
+        self.subscription_rb.SetSelection(sub_idx)
+        vbox.Add(self.subscription_rb, 0, wx.ALL, 8)
+
+        self.cb_subs = wx.CheckBox(self, label="게시판 구독 알림 받기(&B)")
+        self.cb_subs.SetValue(bool(self.settings.get("check_subscriptions", True)))
+        vbox.Add(self.cb_subs, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         # 목록 항목 수 RadioBox (쪽지·메일 목록에서 한 번에 표시할 개수)
         self._list_size_values = list(LIST_PAGE_SIZE_OPTIONS)
         size_labels = [f"{n}개" for n in LIST_PAGE_SIZE_OPTIONS]
@@ -405,11 +441,15 @@ class NotifyPage(wx.Panel):
         interval_sec = self._interval_values[idx]
         size_idx = self.list_size_rb.GetSelection()
         list_page_size = self._list_size_values[size_idx]
+        sub_idx = self.subscription_rb.GetSelection()
+        sub_interval = self._interval_values[sub_idx]
         new_settings = {
             "interval_sec": interval_sec,
             "check_memo": self.cb_memo.GetValue(),
             "check_mail": self.cb_mail.GetValue(),
             "list_page_size": list_page_size,
+            "subscription_interval_sec": sub_interval,
+            "check_subscriptions": self.cb_subs.GetValue(),
         }
         save_notify_settings(new_settings)
         self.settings = new_settings

@@ -70,6 +70,10 @@ class Authenticator:
         self.user_id: str | None = None
         # 로그인 사용자의 닉네임 (게시물 작성자 일치 여부 검증용).
         self.nickname: str | None = None
+        # 초록등대 동호회 회원 등급 텍스트 (예: "동호회관리자", "일반 회원").
+        # WriteDialog 가 동호회관리자에게만 공지 체크박스를 노출하는 등 권한별
+        # UI 분기에 사용.
+        self.rank: str | None = None
 
     def authenticate(self, user_id: str, password: str) -> AuthResult:
         """소리샘 로그인 후 초록등대 동호회 회원 등급을 확인한다."""
@@ -286,6 +290,7 @@ class Authenticator:
 
             # 사용자는 회원 목록에 있음. 등급 검증.
             if matched_rank:
+                self.rank = matched_rank
                 return AuthResult(
                     AuthResult.SUCCESS,
                     f"초록등대 동호회 ({matched_rank}) 인증에 성공했습니다."

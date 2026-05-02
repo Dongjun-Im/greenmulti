@@ -240,7 +240,8 @@ class MainFrame(wx.Frame):
 
     def __init__(self, session: requests.Session,
                  current_user_id: str | None = None,
-                 current_user_nickname: str | None = None):
+                 current_user_nickname: str | None = None,
+                 current_user_rank: str | None = None):
         super().__init__(
             None,
             title=APP_NAME,
@@ -255,8 +256,18 @@ class MainFrame(wx.Frame):
         # 게시물 목록에 표시되는 작성자 닉네임(post.author)과 비교하여 본인
         # 게시물 여부를 빠르게 판단 (서버 HTTP 호출 없이).
         self.current_user_nickname = current_user_nickname
+        # 초록등대 동호회 회원 등급. WriteDialog 의 공지 체크박스 노출 등에 사용.
+        self.current_user_rank = current_user_rank
         self.menu_manager = MenuManager()
         self.menu_manager.load()
+
+        # v1.7 — 즐겨찾기 매니저
+        from bookmark_manager import BookmarkManager
+        self.bookmark_manager = BookmarkManager()
+
+        # v1.7 — 게시판 구독 매니저 (실 폴링은 _start_memo_notifier 시점에 시작)
+        self._subscription_manager = None
+        self._subscription_timer = None
 
         # 현재 보기 상태
         self.current_view = VIEW_MAIN_MENU
@@ -430,10 +441,33 @@ class MainFrame(wx.Frame):
         post_menu.Append(self.id_post_delete, "게시물 삭제(&D)\tAlt+D")
         menubar.Append(post_menu, "게시물(&P)")
 
+        # v1.7 — 즐겨찾기 메뉴
+        bookmarks_menu = wx.Menu()
+        self.id_open_bookmarks = wx.NewIdRef()
+        self.id_add_bookmark = wx.NewIdRef()
+        self.id_command_palette = wx.NewIdRef()
+        self.id_toggle_subscribe = wx.NewIdRef()
+        self.id_open_subscriptions = wx.NewIdRef()
+        self.id_convert_daisy = wx.NewIdRef()
+        self.id_edit_templates = wx.NewIdRef()
+        bookmarks_menu.Append(self.id_open_bookmarks, "즐겨찾기 열기(&O)\tCtrl+B")
+        bookmarks_menu.Append(self.id_add_bookmark, "현재 위치를 즐겨찾기에 추가(&A)\tCtrl+D")
+        bookmarks_menu.AppendSeparator()
+        bookmarks_menu.Append(self.id_toggle_subscribe, "현재 게시판 구독 토글(&S)\tCtrl+Shift+S")
+        bookmarks_menu.Append(self.id_open_subscriptions, "구독 목록 보기(&L)\tCtrl+Alt+L")
+        bookmarks_menu.AppendSeparator()
+        bookmarks_menu.Append(self.id_command_palette, "명령 도구 모음(&P)\tCtrl+P")
+        menubar.Append(bookmarks_menu, "즐겨찾기(&K)")
+
         # 설정 메뉴
         settings_menu = wx.Menu()
         self.id_settings = wx.NewIdRef()
+        self.id_theme_next = wx.NewIdRef()
+        self.id_theme_prev = wx.NewIdRef()
         settings_menu.Append(self.id_settings, "설정(&T)\tF7")
+        settings_menu.AppendSeparator()
+        settings_menu.Append(self.id_theme_next, "다음 화면 테마(&N)\tF6")
+        settings_menu.Append(self.id_theme_prev, "이전 화면 테마(&P)\tShift+F6")
         settings_menu.AppendSeparator()
         settings_menu.Append(self.id_download_dir, "다운로드 폴더 변경(&D)")
         self.id_edit_menu_file = wx.NewIdRef()
@@ -443,21 +477,29 @@ class MainFrame(wx.Frame):
         settings_menu.Append(self.id_edit_menu_file, "메뉴 목록 파일 편집(&M)")
         settings_menu.Append(self.id_reload_menu_file, "메뉴 목록 파일 다시 읽기(&R)")
         settings_menu.Append(self.id_reset_menu_file, "메뉴 목록 자동 감지로 초기화(&I)")
+        settings_menu.AppendSeparator()
+        # v1.7 — 답장 템플릿 파일 편집
+        settings_menu.Append(self.id_edit_templates, "답장 템플릿 파일 편집(&E)")
         menubar.Append(settings_menu, "설정(&S)")
 
         # 도구 메뉴
         tools_menu = wx.Menu()
         self.id_nas_connect = wx.NewIdRef()
+        self.id_nas_logout = wx.NewIdRef()
         self.id_memo_inbox = wx.NewIdRef()
         self.id_memo_compose = wx.NewIdRef()
         self.id_mail_compose = wx.NewIdRef()
         tools_menu.Append(self.id_nas_connect, "초록등대 자료실 연결(&N)\tCtrl+N")
+        tools_menu.Append(self.id_nas_logout, "초록등대 자료실 로그아웃(&O)")
         tools_menu.AppendSeparator()
         tools_menu.Append(self.id_memo_inbox, "쪽지함 열기(&M)\tCtrl+M")
         tools_menu.Append(self.id_memo_compose, "쪽지 쓰기\tCtrl+Shift+M")
         tools_menu.Append(self.id_mail_compose, "메일함 열기\tCtrl+Shift+E")
         self.id_memo_check_now = wx.NewIdRef()
         tools_menu.Append(self.id_memo_check_now, "알림 센터 열기\tCtrl+Shift+N")
+        tools_menu.AppendSeparator()
+        # v1.7 — DAISY 도서 변환은 도구 메뉴에 위치
+        tools_menu.Append(self.id_convert_daisy, "DAISY 도서 변환(&D)\tCtrl+Alt+D")
         menubar.Append(tools_menu, "도구(&T)")
 
         # 도움말 메뉴
@@ -500,6 +542,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_show_settings, id=self.id_settings)
         self.Bind(wx.EVT_MENU, self.on_board_refresh, id=self.id_board_refresh)
         self.Bind(wx.EVT_MENU, self._on_menu_nas_connect, id=self.id_nas_connect)
+        self.Bind(wx.EVT_MENU, self._on_menu_nas_logout, id=self.id_nas_logout)
         self.Bind(wx.EVT_MENU, self.on_open_memo_inbox, id=self.id_memo_inbox)
         self.Bind(wx.EVT_MENU, self.on_open_memo_compose, id=self.id_memo_compose)
         self.Bind(wx.EVT_MENU, self.on_open_mail_compose, id=self.id_mail_compose)
@@ -507,6 +550,15 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_edit_menu_file, id=self.id_edit_menu_file)
         self.Bind(wx.EVT_MENU, self.on_reload_menu_file, id=self.id_reload_menu_file)
         self.Bind(wx.EVT_MENU, self.on_reset_menu_file, id=self.id_reset_menu_file)
+        self.Bind(wx.EVT_MENU, self.on_open_bookmarks, id=self.id_open_bookmarks)
+        self.Bind(wx.EVT_MENU, self.on_add_bookmark, id=self.id_add_bookmark)
+        self.Bind(wx.EVT_MENU, self.on_open_command_palette, id=self.id_command_palette)
+        self.Bind(wx.EVT_MENU, self.on_toggle_subscription, id=self.id_toggle_subscribe)
+        self.Bind(wx.EVT_MENU, self.on_open_subscriptions, id=self.id_open_subscriptions)
+        self.Bind(wx.EVT_MENU, self.on_convert_daisy, id=self.id_convert_daisy)
+        self.Bind(wx.EVT_MENU, self.on_edit_reply_templates, id=self.id_edit_templates)
+        self.Bind(wx.EVT_MENU, self.on_theme_next, id=self.id_theme_next)
+        self.Bind(wx.EVT_MENU, self.on_theme_prev, id=self.id_theme_prev)
 
     def _build_status_bar(self):
         self.status_bar = self.CreateStatusBar(2)
@@ -554,6 +606,15 @@ class MainFrame(wx.Frame):
         menu.Append(self.id_post_edit, "게시물 수정(&M)\tAlt+M")
         menu.Append(self.id_post_delete, "게시물 삭제(&D)\tAlt+D")
         menu.AppendSeparator()
+        # v1.7 — 게시물을 열지 않고 첨부파일 즉시 다운로드 (D 단축키와 동일)
+        id_dl = wx.NewIdRef()
+        menu.Append(id_dl, "선택한 게시물 첨부파일 저장(&S)\tD")
+        self.Bind(
+            wx.EVT_MENU,
+            lambda e: self._download_post_attachments_from_list(),
+            id=id_dl,
+        )
+        menu.AppendSeparator()
         menu.Append(self.id_search, "게시물 검색(&F)\tCtrl+F")
         menu.Append(self.id_board_refresh, "게시판 새로고침(&R)\tF5")
 
@@ -588,6 +649,20 @@ class MainFrame(wx.Frame):
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("-"), self.id_zoom_out),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_NUMPAD_SUBTRACT, self.id_zoom_out),
             wx.AcceleratorEntry(wx.ACCEL_CTRL, ord("0"), self.id_zoom_reset),
+            # v1.7 — DAISY 변환 / 구독 목록 보기
+            wx.AcceleratorEntry(
+                wx.ACCEL_CTRL | wx.ACCEL_ALT, ord("D"), self.id_convert_daisy,
+            ),
+            wx.AcceleratorEntry(
+                wx.ACCEL_CTRL | wx.ACCEL_ALT, ord("L"), self.id_open_subscriptions,
+            ),
+            # 화면 테마 순환 — F6 (다음) / Shift+F6 (이전)
+            wx.AcceleratorEntry(
+                wx.ACCEL_NORMAL, wx.WXK_F6, self.id_theme_next,
+            ),
+            wx.AcceleratorEntry(
+                wx.ACCEL_SHIFT, wx.WXK_F6, self.id_theme_prev,
+            ),
         ]
         self.SetAcceleratorTable(wx.AcceleratorTable(entries))
 
@@ -647,6 +722,41 @@ class MainFrame(wx.Frame):
         save_font_size(DEFAULT_FONT_SIZE)
         self._apply_full_theme()
         speak(f"글꼴 크기를 원래대로 되돌렸습니다. {DEFAULT_FONT_SIZE}")
+
+    # ── 화면 테마 순환 (F6 / Shift+F6) ──
+
+    def _cycle_theme(self, direction: int):
+        """저장된 THEME_PRESETS 키 목록을 순환해 +/-1 위치로 이동."""
+        try:
+            from theme import (
+                THEME_PRESETS, load_theme_key, set_current_theme,
+                get_current_theme_name,
+            )
+        except Exception:
+            return
+        keys = list(THEME_PRESETS.keys())
+        if not keys:
+            return
+        cur_key = load_theme_key()
+        try:
+            idx = keys.index(cur_key)
+        except ValueError:
+            idx = 0
+        new_key = keys[(idx + direction) % len(keys)]
+        set_current_theme(new_key)
+        self._apply_full_theme()
+        try:
+            speak(f"테마 변경: {get_current_theme_name()}")
+        except Exception:
+            pass
+
+    def on_theme_next(self, event=None):
+        """F6: 다음 화면 테마로 변경."""
+        self._cycle_theme(1)
+
+    def on_theme_prev(self, event=None):
+        """Shift+F6: 이전 화면 테마로 변경."""
+        self._cycle_theme(-1)
 
     def on_show_settings(self, event):
         """F7: 통합 설정 대화상자 (테마 + 사운드 + 알림 + 업데이트)."""
@@ -900,6 +1010,10 @@ class MainFrame(wx.Frame):
             "img", "관리자", "철머",
             "로그아웃", "돌아가기",
             "소리샘 동사무소", "동사무소",
+            # 초록등대 자료실(cl=green4) / 엔터테인먼트 자료실(cl=green6) 진입 시
+            # 자동 노출되는 클럽 네비게이션 링크 — 사용자에겐 노이즈.
+            "일반 동호회 바로가기", "일반동호회 바로가기",
+            "초록등대 바로가기", "초록등대",
         }
         # 현재 메뉴명만 노이즈로 추가
         if clean_menu:
@@ -971,6 +1085,36 @@ class MainFrame(wx.Frame):
                     f"  REJECT [post_link] url={url!r} text={m.name!r}"
                 )
                 continue
+
+            # 부모 카테고리/자기 자신으로 돌아가는 navigation 링크 거부.
+            # sorisem 은 클럽 내부 카테고리 페이지(/?mo=greenN&cl=green 등) 응답에
+            # "일반 동호회"(/?mo=circle), 부모 클럽 자체(/?mo=green&cl=green) 같은
+            # 상위 navigation 링크를 sub-menu 처럼 끼워 넣는다. sub-menu 노이즈로 거부.
+            PARENT_NAV_URLS_LOW = {
+                "/?mo=circle",
+                "/?mo=circle&cl=circle",
+                "/?mo=potion",
+                "/?mo=potion&cl=potion",
+            }
+            if url_lower in PARENT_NAV_URLS_LOW:
+                _diag_lines.append(
+                    f"  REJECT [parent_nav] url={url!r} text={m.name!r}"
+                )
+                continue
+
+            # 현재 클럽 자체로 돌아가는 self-link 거부 (부모 클럽 hub).
+            # 예: cl=green 컨텍스트에서 /?mo=green&cl=green 또는
+            # /plugin/ar.club/?cl=green 은 자기 자신 링크 → sub-menu 노이즈.
+            if current_cl:
+                self_urls_low = {
+                    f"/?mo={current_cl}&cl={current_cl}".lower(),
+                    f"/plugin/ar.club/?cl={current_cl}".lower(),
+                }
+                if url_lower in self_urls_low:
+                    _diag_lines.append(
+                        f"  REJECT [self_nav] url={url!r} text={m.name!r}"
+                    )
+                    continue
 
             # 초록등대 동호회 자료실/엔터테인먼트 자료실 링크는 초록등대 동호회
             # 컨텍스트(cl=green)에서 하위 메뉴를 볼 때만 표시. 소리샘 자료실
@@ -1093,8 +1237,13 @@ class MainFrame(wx.Frame):
             # 기존 번호 제거
             text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
 
-            # 카테고리 헤더 / 노이즈 제거
-            if text.lower() in {h.lower() for h in header_noise}:
+            # 카테고리 헤더 / 노이즈 제거.
+            # 비교 전 텍스트를 정규화 — NBSP/Tab/연속 공백을 단일 공백으로 합쳐
+            # 사이트 응답에 미세한 공백 차이가 있어도 매칭되도록 한다.
+            text_norm = re.sub(r"\s+", " ", text).strip()
+            if text_norm.lower() in {
+                re.sub(r"\s+", " ", h).strip().lower() for h in header_noise
+            }:
                 _diag_lines.append(
                     f"  REJECT [header_noise] url={url!r} text={original_text!r}"
                 )
@@ -1106,9 +1255,22 @@ class MainFrame(wx.Frame):
                     f"  REJECT [contains_동사무소] url={url!r} text={original_text!r}"
                 )
                 continue
-            if not text or len(text) < 2:
+            # 4. 자료실(cl=green4) / 6. 엔터테인먼트 자료실(cl=green6) 진입 시
+            # 자동 노출되는 클럽 네비게이션 — 부분 문자열 매칭으로 강하게 거부.
+            # 사용자가 미세한 공백·구두점 차이로 매번 패치를 요청하지 않도록 한다.
+            if (
+                "동호회 바로가기" in text_norm
+                or "동호회바로가기" in text_norm
+                or "초록등대 바로가기" in text_norm
+                or "초록등대바로가기" in text_norm
+            ):
                 _diag_lines.append(
-                    f"  REJECT [text_too_short] url={url!r} text={original_text!r}"
+                    f"  REJECT [club_nav_link] url={url!r} text={original_text!r}"
+                )
+                continue
+            if not text:
+                _diag_lines.append(
+                    f"  REJECT [text_empty] url={url!r} text={original_text!r}"
                 )
                 continue
             # 중복 제거
@@ -1147,25 +1309,56 @@ class MainFrame(wx.Frame):
             seen_texts2: set[str] = set()
             num2 = 1
             from menu_manager import extract_shortcut_code as _esc
+            # rescue: 우선 메인 메뉴와 *겹치지 않는* 항목만 모은다. 대부분의
+            # 카테고리 페이지는 사이드바(메인 메뉴) 와 그 페이지 고유 항목을
+            # 함께 갖는다. 메인 메뉴와 겹치는 부분은 사이드바이고, 나머지가
+            # 진짜 하위 메뉴.
+            # 진짜 하위 메뉴가 하나도 없으면(=페이지가 메인 사이드바만 돌려준
+            # 상황: /?mo=pds, /?mo=lib2013 같은 빈/이름만 있는 카테고리)
+            # 사용자가 헷갈리지 않도록 안내 문구만 보여 준다 (메인 메뉴 중복
+            # 항목을 다시 노출하지 않는다).
+            rescue_candidates: list = []
+            had_only_main_menu = True
             for m in sub_menus:
                 url = (m.url or "").strip()
                 if not url or url in ("/", "", "#") or url == source_url:
                     continue
-                # 게시글 본문 링크는 하위 메뉴가 아님
                 if "wr_id=" in url.lower():
                     continue
                 text = (m.display_text or "").strip()
-                # 번호 접두사 제거
                 text = re.sub(r"^\d+[\.\)]\s*", "", text).strip()
                 if not text or len(text) < 2 or len(text) > 60:
                     continue
-                if text.lower() in {h.lower() for h in header_noise}:
+                text_norm_r = re.sub(r"\s+", " ", text).strip()
+                if text_norm_r.lower() in {
+                    re.sub(r"\s+", " ", h).strip().lower() for h in header_noise
+                }:
                     continue
                 if "동사무소" in text:
+                    continue
+                if (
+                    "동호회 바로가기" in text_norm_r
+                    or "동호회바로가기" in text_norm_r
+                    or "초록등대 바로가기" in text_norm_r
+                    or "초록등대바로가기" in text_norm_r
+                ):
                     continue
                 if text.lower() in seen_texts2:
                     continue
                 seen_texts2.add(text.lower())
+                # 메인 메뉴 URL/코드와 정확히 겹치는 항목은 별도로 두고, 진짜
+                # 하위 메뉴 후보(rescue_candidates) 와 분리.
+                sub_code_r = (extract_shortcut_code(url) or "").strip().lower()
+                is_main = (
+                    url in main_menu_urls
+                    or (sub_code_r and sub_code_r in main_menu_codes
+                        and sub_code_r != current_code)
+                )
+                if not is_main:
+                    rescue_candidates.append((url, text, m))
+                    had_only_main_menu = False
+
+            for url, text, m in rescue_candidates:
                 code = _esc(url) or ""
                 if code:
                     display_items.append(f"{num2}. {text} (바로가기 코드: {code})")
@@ -1177,9 +1370,13 @@ class MainFrame(wx.Frame):
                 )
                 num2 += 1
 
-        # 그래도 비어 있으면 안내 문구
         if not filtered_subs:
-            display_items = ["0. 메인 메뉴로 돌아가기", "게시물이 없습니다."]
+            # 페이지가 비어있다는 것 + URL 이 잘못되었을 가능성을 동시에 안내.
+            display_items = [
+                "0. 메인 메뉴로 돌아가기",
+                f"이 페이지({source_url})는 별도 하위 메뉴를 제공하지 않습니다.",
+                "사이트에서 다른 URL을 사용한다면 설정 메뉴 > '메뉴 목록 파일 편집' 에서 URL을 바꿔 주세요.",
+            ]
 
         # 진단 로그 파일 저장
         try:
@@ -1197,6 +1394,19 @@ class MainFrame(wx.Frame):
     def _show_post_list(self, posts: list[PostItem], menu_name: str,
                         board_url: str = "", page: int = 1):
         self.current_view = VIEW_POST_LIST
+        # 4. 자료실(cl=green4) / 6. 엔터테인먼트 자료실(cl=green6) 같은 페이지는
+        # sorisem 응답에 "일반 동호회 바로가기", "초록등대 바로가기" 같은 클럽
+        # 네비게이션 링크가 게시물처럼 섞여 들어오는 사례가 있다. 게시물 목록
+        # 표시 직전에 제목 기반으로 한 번 더 거른다.
+        def _is_nav_noise(p) -> bool:
+            t = re.sub(r"\s+", " ", (p.title or "")).strip()
+            return (
+                "동호회 바로가기" in t
+                or "동호회바로가기" in t
+                or "초록등대 바로가기" in t
+                or "초록등대바로가기" in t
+            )
+        posts = [p for p in posts if not _is_nav_noise(p)]
         self.current_posts = posts
         self.current_menu_name = menu_name
         if board_url:
@@ -1265,21 +1475,234 @@ class MainFrame(wx.Frame):
         def worker():
             try:
                 full_url = url if url.startswith("http") else f"{SORISEM_BASE_URL}{url}"
-                resp = self.session.get(full_url, timeout=15)
-                wx.CallAfter(callback, resp.text, None)
+                # cl= 가 있는 board.php 호출은 sorisem 이 hub 컨텍스트를 요구한다.
+                # worker 내부에서 hub 를 먼저 동기적으로 호출해 세션 컨텍스트를 갖춘
+                # 뒤 본 요청을 보낸다. 한 세션당 hub 별로 한 번만 워밍업.
+                referer = None
+                if "bo_table=" in url and re.search(r"[?&]cl=([^&#]+)", url):
+                    m_cl = re.search(r"[?&]cl=([^&#]+)", url)
+                    cl_val = m_cl.group(1) if m_cl else ""
+                    if cl_val:
+                        # 매 호출마다 hub 를 재방문해 세션 컨텍스트를 강제로 갱신
+                        # (캐시 사용 금지). sorisem 은 hub fetch 한 번 후 다른
+                        # 카테고리 hub 를 거치면 cl 컨텍스트가 풀리는 동작을 보여
+                        # 캐싱하면 권한 오류로 이어진다.
+                        hub_path = f"/?mo={cl_val}&cl={cl_val}"
+                        try:
+                            hub_resp = self.session.get(
+                                f"{SORISEM_BASE_URL}{hub_path}", timeout=15,
+                            )
+                            try:
+                                from config import DATA_DIR
+                                import os as _os
+                                safe = re.sub(r"[^A-Za-z0-9]+", "_", hub_path)[:40]
+                                _os.makedirs(DATA_DIR, exist_ok=True)
+                                with open(
+                                    _os.path.join(DATA_DIR, f"warmup_{safe}.html"),
+                                    "w", encoding="utf-8",
+                                ) as _wf:
+                                    _wf.write(hub_resp.text)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        referer = f"{SORISEM_BASE_URL}{hub_path}"
+
+                # ar.club nested 클럽 (예: cl=hims, cl=green3) 직접 호출 시
+                # 부모 클럽 hub (cl=green) 를 거치지 않으면 sorisem 이
+                # "게시판 접근권한이 없습니다" 로 거부한다. 메인 메뉴에서 클릭
+                # 하면 자연스럽게 cl=green 을 먼저 거치지만, 바로가기 코드로
+                # 직접 진입하는 경우엔 부모 클럽을 명시적으로 워밍업해야 한다.
+                if "/plugin/ar.club/" in url:
+                    m_cl_club = re.search(r"[?&]cl=([^&#]+)", url)
+                    cl_club = m_cl_club.group(1).lower() if m_cl_club else ""
+                    # cl=green 자체는 부모 — 워밍업 불필요.
+                    # 그 외(cl=hims, cl=green2 등) 는 cl=green 부모 hub 를 먼저 호출.
+                    if cl_club and cl_club != "green":
+                        parent_hub = "/plugin/ar.club/?cl=green"
+                        try:
+                            self.session.get(
+                                f"{SORISEM_BASE_URL}{parent_hub}", timeout=15,
+                            )
+                        except Exception:
+                            pass
+                        if not referer:
+                            referer = f"{SORISEM_BASE_URL}{parent_hub}"
+
+                headers = {"Referer": referer} if referer else None
+                resp = self.session.get(full_url, timeout=15, headers=headers)
+                html = resp.text
+
+                # 진단용 세션 상태 로그.
+                try:
+                    from config import DATA_DIR
+                    import os as _os
+                    _os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(
+                        _os.path.join(DATA_DIR, "session_debug.log"),
+                        "a", encoding="utf-8",
+                    ) as _sf:
+                        cookies_str = "; ".join(
+                            f"{c.name}={c.value[:20]}..."
+                            if len(c.value) > 20
+                            else f"{c.name}={c.value}"
+                            for c in self.session.cookies
+                        )
+                        member_match = re.search(
+                            r'g5_is_member\s*=\s*"([^"]*)"', html,
+                        )
+                        member_val = member_match.group(1) if member_match else "?"
+                        _sf.write(
+                            f"\n=== {url} ===\n"
+                            f"status={resp.status_code} bytes={len(html)}\n"
+                            f"g5_is_member={member_val!r}\n"
+                            f"referer={referer}\n"
+                            f"cookies={cookies_str}\n"
+                        )
+                except Exception:
+                    pass
+
+                # 세션 만료 / 권한 거부 자동 복구. 응답에 sorisem 의 표준 거부
+                # 메시지가 보이면 저장된 자격증명으로 재로그인 후 한 번 더 시도.
+                access_denied = (
+                    "접근권한이 없습니다" in html
+                    or "오류안내" in html
+                )
+                if access_denied and self._try_relogin():
+                    try:
+                        # 재로그인 후엔 hub 를 다시 방문해 컨텍스트를 다시 만든다.
+                        if referer:
+                            self.session.get(referer, timeout=15)
+                        resp2 = self.session.get(full_url, timeout=15, headers=headers)
+                        html = resp2.text
+                        try:
+                            from config import DATA_DIR
+                            import os as _os
+                            with open(
+                                _os.path.join(DATA_DIR, "session_debug.log"),
+                                "a", encoding="utf-8",
+                            ) as _sf:
+                                _sf.write(
+                                    f"--- after relogin retry ---\n"
+                                    f"status={resp2.status_code} bytes={len(html)}\n"
+                                )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                wx.CallAfter(callback, html, None)
             except requests.exceptions.RequestException as e:
                 wx.CallAfter(callback, None, str(e))
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
+    def _try_relogin(self) -> bool:
+        """저장된 자격증명으로 sorisem 에 다시 로그인.
+
+        반환값: 재로그인 성공 시 True. 실패하거나 자격증명이 저장되지 않았으면 False.
+        한 번 시도하면 30초 동안 재시도하지 않는다 (실패 폭주 방지).
+        """
+        import time
+        last = getattr(self, "_last_relogin_attempt", 0)
+        if time.time() - last < 30:
+            return False
+        self._last_relogin_attempt = time.time()
+
+        try:
+            from credentials import load_credentials
+            from authenticator import Authenticator
+            creds = load_credentials()
+            if not creds:
+                return False
+            user_id, password = creds
+            # 같은 세션 객체를 재사용해 쿠키를 그 자리에서 갱신.
+            auth = Authenticator()
+            auth.session = self.session
+            result = auth._login(user_id, password)
+            return bool(result and result.is_success)
+        except Exception:
+            return False
+
+    def _warmup_session_for(self, url: str):
+        """가상 하위 메뉴 진입 시 sorisem 세션 컨텍스트를 미리 설정.
+
+        sorisem 은 `/?mo=XXX&cl=XXX` hub 페이지를 한 번 거쳐야 해당 카테고리의
+        board.php 게시판 호출이 허용된다. 가상 하위 메뉴는 hub fetch 를 생략하므로
+        백그라운드 스레드에서 hub URL 과 (가능하면) cl 컨텍스트 URL 을 GET 해
+        세션 쿠키를 채워둔다. 결과는 사용하지 않고 폐기.
+        """
+        warm_urls = []
+        # url 자체가 hub 형태(`?mo=XXX&cl=XXX` 또는 `?mo=XXX`)면 그대로 GET.
+        if url and "/?mo=" in url:
+            warm_urls.append(url)
+        # cl 값을 추출해 `/?mo=cl&cl=cl` 형태도 같이 워밍업
+        if url:
+            m = re.search(r"[?&]cl=([^&#]+)", url)
+            if m:
+                cl_val = m.group(1)
+                hub2 = f"/?mo={cl_val}&cl={cl_val}"
+                if hub2 not in warm_urls:
+                    warm_urls.append(hub2)
+
+        if not warm_urls:
+            return
+
+        seen = getattr(self, "_warmed_session_urls", None)
+        if seen is None:
+            seen = set()
+            self._warmed_session_urls = seen
+
+        def worker():
+            for u in warm_urls:
+                if u in seen:
+                    continue
+                try:
+                    full = u if u.startswith("http") else f"{SORISEM_BASE_URL}{u}"
+                    self.session.get(full, timeout=15)
+                    seen.add(u)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _load_and_show(self, url: str, name: str):
+        # v1.7 — 가상 하위 메뉴 처리. sorisem 의 hub 페이지가 비어 있거나
+        # 별도로 sub 목록을 응답하지 않는 메인 메뉴 항목(예: 7. 전자도서관) 은
+        # 코드에서 정의한 sub-item 목록을 그대로 표시한다. 네트워크 fetch 없이
+        # 즉시 sub-menu 화면으로 전환.
+        try:
+            from menu_manager import VIRTUAL_SUBMENUS
+            virt = VIRTUAL_SUBMENUS.get(url)
+        except Exception:
+            virt = None
+        if virt:
+            self.status_bar.SetStatusText(f"{name} 로딩 중...", 0)
+            speak(f"{name} 로딩 중입니다.")
+            # 세션 컨텍스트 워밍업 — sorisem 은 /?mo=XXX&cl=XXX hub 를 거치지
+            # 않은 채 cl=XXX 게시판을 직접 호출하면 "게시판 접근권한이 없습니다"
+            # 로 거부한다. 가상 하위 메뉴 진입 시에는 hub fetch 가 생략되므로
+            # 여기서 백그라운드로 한 번 GET 해 세션 쿠키를 채워둔다.
+            self._warmup_session_for(url)
+            virtual_items = [
+                SubMenuItem(name=sub_name, url=sub_url)
+                for sub_name, sub_url, _t in virt
+            ]
+            self._show_sub_menu(virtual_items, name, base_url=url)
+            self.status_bar.SetStatusText("준비", 0)
+            return
+
         self.status_bar.SetStatusText(f"{name} 로딩 중...", 0)
         speak(f"{name} 로딩 중입니다.")
 
         board_url = url
 
         def on_loaded(html, error):
+            # board_url 을 콜백 안에서 자동 폴백 결과로 갱신할 수 있도록
+            # 외부 클로저 변수를 명시적으로 끌어 쓴다 (없으면 로컬로 처리되어
+            # 같은 이름을 먼저 읽는 줄에서 UnboundLocalError 발생).
+            nonlocal board_url
             if error:
                 speak(f"페이지를 불러올 수 없습니다. {error}")
                 self.status_bar.SetStatusText("준비", 0)
@@ -1290,19 +1713,81 @@ class MainFrame(wx.Frame):
                 self.status_bar.SetStatusText("준비", 0)
                 return
 
-            # 카테고리 랜딩 페이지(`/?mo=XXX`, bo_table·cl 없음) 인지 판정.
-            # 이런 페이지는 본문이나 게시글 목록이 아니라 동호회·섹션 링크
-            # 모음이므로, parse_board_list / parse_post_content 가 잘못 잡지
-            # 못하도록 하위 메뉴 흐름을 먼저 시도한다.
+            # 카테고리 랜딩 페이지(`/?mo=XXX` 형식, bo_table 없음) 판정.
+            # cl= 가 같이 있더라도 bo_table 만 없으면 카테고리 페이지로 간주한다.
+            # (예: 8.노원시각장애인학습지원센터 = /?mo=edu2013&cl=edu2013 — 클럽
+            # 메인 페이지지만 본문이 아니라 하위 섹션 모음이므로 동일 흐름 사용.)
             is_category_page = (
                 bool(re.search(r"[?&]mo=[a-zA-Z0-9_]+", board_url))
                 and "bo_table=" not in board_url
-                and "cl=" not in board_url
             )
 
+            # 진단용: bo_table 이 없는 페이지(/?mo=... 또는 /?mo=...&cl=...) 는
+            # 항상 HTML 을 data/ 로 덤프해 사용자가 공유할 수 있게 한다.
+            if "bo_table=" not in board_url:
+                try:
+                    from config import DATA_DIR
+                    safe_dbg = re.sub(r"[^A-Za-z0-9]+", "_", board_url)[:40]
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(
+                        os.path.join(DATA_DIR, f"category_{safe_dbg}.html"),
+                        "w", encoding="utf-8",
+                    ) as _df:
+                        _df.write(html)
+                except Exception:
+                    pass
+
             if is_category_page:
-                # 디버그 덤프 — 카테고리 페이지 HTML 을 data/ 에 저장해, 동호회 등이
-                # 빈 결과로 보일 때 사용자가 파일을 공유하면 셀렉터를 보강할 수 있다.
+                sub_menus = parse_sub_menus(html, base_url=board_url)
+                # parse_sub_menus 가 1~2개만 반환해도 fallback 을 합쳐 더 넓게.
+                fallback_links = self._extract_fallback_links(html)
+                # 합치되 중복 제거 (URL 기준)
+                merged: list = []
+                seen_urls: set[str] = set()
+                for item in list(sub_menus or []) + list(fallback_links or []):
+                    if item.url in seen_urls:
+                        continue
+                    seen_urls.add(item.url)
+                    merged.append(item)
+
+                # v1.7 — 자동 폴백:
+                # /?mo=XXX (cl 없음) URL 이 sorisem 측에서 카테고리 콘텐츠 없이
+                # 메인 사이드바만 응답하는 경우(자료실·전자도서관 등), URL 을
+                # /?mo=XXX&cl=XXX 형태로 한 번 더 시도해 본다. cl 패턴은 7·8번
+                # 카테고리에서 sorisem 이 사용하는 형식과 동일.
+                if self._looks_like_main_sidebar_only(merged) and "cl=" not in board_url:
+                    m_mo = re.search(r"[?&]mo=([a-zA-Z0-9_]+)", board_url)
+                    if m_mo:
+                        mo_val = m_mo.group(1)
+                        retry_url = (
+                            board_url + ("&" if "?" in board_url else "?")
+                            + f"cl={mo_val}"
+                        )
+                        try:
+                            full_retry = (
+                                retry_url if retry_url.startswith("http")
+                                else f"{SORISEM_BASE_URL}{retry_url}"
+                            )
+                            resp = self.session.get(full_retry, timeout=15)
+                            html2 = resp.text
+                        except Exception:
+                            html2 = ""
+                        if html2 and len(html2) > 50:
+                            sm2 = parse_sub_menus(html2, base_url=retry_url)
+                            fb2 = self._extract_fallback_links(html2)
+                            merged2: list = []
+                            seen2: set[str] = set()
+                            for it2 in list(sm2 or []) + list(fb2 or []):
+                                if it2.url in seen2:
+                                    continue
+                                seen2.add(it2.url)
+                                merged2.append(it2)
+                            if merged2 and not self._looks_like_main_sidebar_only(merged2):
+                                board_url = retry_url
+                                merged = merged2
+                                html = html2
+
+                # 디버그 덤프 — bo_table 이 없는 모든 페이지를 data/ 로 저장.
                 try:
                     from config import DATA_DIR
                     safe = re.sub(r"[^A-Za-z0-9]+", "_", board_url)[:40]
@@ -1315,17 +1800,6 @@ class MainFrame(wx.Frame):
                 except Exception:
                     pass
 
-                sub_menus = parse_sub_menus(html, base_url=board_url)
-                # parse_sub_menus 가 1~2개만 반환해도 fallback 을 합쳐 더 넓게.
-                fallback_links = self._extract_fallback_links(html)
-                # 합치되 중복 제거 (URL 기준)
-                merged: list = []
-                seen_urls: set[str] = set()
-                for item in list(sub_menus or []) + list(fallback_links or []):
-                    if item.url in seen_urls:
-                        continue
-                    seen_urls.add(item.url)
-                    merged.append(item)
                 if merged:
                     self._show_sub_menu(merged, name, base_url=board_url)
                     return
@@ -1340,8 +1814,80 @@ class MainFrame(wx.Frame):
                 self._show_post_list(posts, name, board_url, 1)
                 return
 
+            # v1.7 — 자동 폴백:
+            # (a) "게시판 접근권한이 없습니다" 응답이면 hub URL (/?mo=XXX&cl=XXX)
+            #     을 한 번 GET 해 세션 컨텍스트를 만들고 원본을 재요청.
+            # (b) 여전히 글이 0건이면 cl= 를 떼고 다시 시도.
+            access_denied = (
+                "접근권한이 없습니다" in html
+                or "오류안내" in html
+                or "history.back()" in html
+            )
+            if (
+                "bo_table=" in board_url
+                and re.search(r"[?&]cl=([^&#]+)", board_url)
+                and (not posts or access_denied)
+            ):
+                m_cl = re.search(r"[?&]cl=([^&#]+)", board_url)
+                cl_val = m_cl.group(1) if m_cl else ""
+
+                # (a) hub 워밍업 후 원본 재시도
+                if cl_val and access_denied:
+                    try:
+                        hub_url = f"{SORISEM_BASE_URL}/?mo={cl_val}&cl={cl_val}"
+                        self.session.get(hub_url, timeout=15)
+                        full_orig = (
+                            board_url if board_url.startswith("http")
+                            else f"{SORISEM_BASE_URL}{board_url}"
+                        )
+                        resp = self.session.get(full_orig, timeout=15)
+                        html_retry = resp.text
+                    except Exception:
+                        html_retry = ""
+                    if html_retry and len(html_retry) > 50:
+                        posts_retry = parse_board_list(html_retry)
+                        if posts_retry:
+                            self.current_board_url = board_url
+                            self._show_post_list(posts_retry, name, board_url, 1)
+                            return
+                        # 재시도 결과로 html 갱신해 (b) 폴백에 사용
+                        html = html_retry
+
+                # (b) cl= 파라미터 제거 후 재시도
+                retry_url = re.sub(r"[?&]cl=[^&#]+", "", board_url)
+                retry_url = retry_url.replace("?&", "?").rstrip("?&")
+                try:
+                    full_retry = (
+                        retry_url if retry_url.startswith("http")
+                        else f"{SORISEM_BASE_URL}{retry_url}"
+                    )
+                    resp = self.session.get(full_retry, timeout=15)
+                    html2 = resp.text
+                except Exception:
+                    html2 = ""
+                if html2 and len(html2) > 50:
+                    posts2 = parse_board_list(html2)
+                    if posts2:
+                        self.current_board_url = board_url
+                        self._show_post_list(posts2, name, board_url, 1)
+                        return
+
             # URL에 bo_table이 있으면 게시판 → 글이 0개인 빈 게시판
             if "bo_table=" in board_url:
+                # 진단용: 빈 게시판으로 판정된 HTML 을 data/ 로 덤프해
+                # parse 실패인지 진짜 0건인지 사용자가 공유할 수 있게 한다.
+                try:
+                    from config import DATA_DIR
+                    safe = re.sub(r"[^A-Za-z0-9]+", "_", board_url)[:40]
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(
+                        os.path.join(DATA_DIR, f"empty_board_{safe}.html"),
+                        "w", encoding="utf-8",
+                    ) as _df:
+                        _df.write(html)
+                except Exception:
+                    pass
+
                 self.current_board_url = board_url
                 self.current_view = VIEW_POST_LIST
                 self.current_posts = []
@@ -1375,6 +1921,41 @@ class MainFrame(wx.Frame):
             self.status_bar.SetStatusText("준비", 0)
 
         self._fetch_page(url, on_loaded)
+
+    def _looks_like_main_sidebar_only(self, items: list) -> bool:
+        """페이지가 메인 메뉴 사이드바만 노출했는지 휴리스틱 판정.
+
+        items 의 절반 이상이 `menu_manager.menus` 의 URL 이면 카테고리 콘텐츠
+        없이 사이드바만 돌려준 페이지로 본다. /?mo=pds, /?mo=lib2013 같은 빈
+        카테고리 응답에서 자동 폴백을 트리거하는 데 사용.
+        """
+        if not items:
+            return True
+        try:
+            main_urls = {m.url for m in self.menu_manager.menus}
+        except Exception:
+            return False
+        if not main_urls:
+            return False
+        n_total = 0
+        n_main = 0
+        for it in items:
+            url = (it.url or "").strip()
+            if not url or url in ("/", "", "#"):
+                continue
+            if "wr_id=" in url.lower():
+                continue
+            n_total += 1
+            # 절대 URL 도 상대로 정규화해 비교
+            check_url = url
+            if check_url.startswith("http") and SORISEM_BASE_URL in check_url:
+                check_url = check_url.replace(SORISEM_BASE_URL, "")
+            if check_url in main_urls:
+                n_main += 1
+        if n_total == 0:
+            return True
+        # 절반 이상이 메인 메뉴 URL이면 사이드바만 응답한 것으로 판정
+        return n_main >= max(2, n_total // 2)
 
     def _extract_fallback_links(self, html: str) -> list:
         """페이지에서 노이즈를 제외한 의미 있는 모든 `<a>` 링크를 SubMenuItem
@@ -1447,6 +2028,26 @@ class MainFrame(wx.Frame):
             self.on_search()
             return
 
+        # Ctrl+B: 즐겨찾기 열기 — v1.7
+        elif keycode == ord("B") and ctrl and not shift:
+            self.on_open_bookmarks()
+            return
+
+        # Ctrl+D: 현재 게시판/게시물 즐겨찾기에 추가 — v1.7
+        elif keycode == ord("D") and ctrl and not shift and not alt:
+            self.on_add_bookmark()
+            return
+
+        # Ctrl+P: 명령 도구 모음 — v1.7
+        elif keycode == ord("P") and ctrl and not shift and not alt:
+            self.on_open_command_palette()
+            return
+
+        # Ctrl+Shift+S: 현재 게시판 구독 토글 — v1.7
+        elif keycode == ord("S") and ctrl and shift and not alt:
+            self.on_toggle_subscription()
+            return
+
         # Ctrl+G: 페이지 이동
         elif keycode == ord("G") and ctrl:
             self.on_goto_page()
@@ -1515,11 +2116,21 @@ class MainFrame(wx.Frame):
             self._edit_post()
 
         # Alt+D 또는 Delete: 게시물 삭제
-        elif keycode in (ord("D"), ord("d")) and alt:
+        elif keycode in (ord("D"), ord("d")) and alt and not ctrl:
             self._delete_post()
         elif keycode == wx.WXK_DELETE:
             if self.current_view == VIEW_POST_LIST:
                 self._delete_post()
+
+        # D (단독): 게시물 목록에서 첨부파일 자동 다운로드 — v1.7
+        elif (
+            keycode in (ord("D"), ord("d"))
+            and not ctrl and not alt and not shift
+        ):
+            if self.current_view == VIEW_POST_LIST:
+                self._download_post_attachments_from_list()
+            else:
+                event.Skip()
 
         # PageUp/PageDown: 페이지 이동
         elif keycode == wx.WXK_PAGEUP:
@@ -1562,7 +2173,10 @@ class MainFrame(wx.Frame):
             return
 
         from write_dialog import WriteDialog
-        dialog = WriteDialog(self, self.session, bo_table)
+        dialog = WriteDialog(
+            self, self.session, bo_table,
+            user_rank=self.current_user_rank,
+        )
         result = dialog.ShowModal()
         dialog.Destroy()
 
@@ -1863,6 +2477,58 @@ class MainFrame(wx.Frame):
                 "오류", wx.OK | wx.ICON_ERROR, self,
             )
 
+    def _on_menu_nas_logout(self, event):
+        """메뉴바 '도구 > 초록등대 자료실 로그아웃' 핸들러.
+
+        확인 대화상자를 거친 뒤 마운트된 드라이브를 분리하고 저장된 NAS
+        자격증명(아이디·비밀번호)을 삭제한다. 다음 연결 시도 시 사용자가 다시
+        입력해야 한다.
+        """
+        try:
+            from nas import (
+                get_mounted_drive, unmount,
+                load_nas_credentials, delete_nas_credentials,
+            )
+        except Exception as e:
+            speak(f"NAS 모듈을 불러올 수 없습니다. {e}")
+            return
+
+        has_creds = bool(load_nas_credentials())
+        drive = get_mounted_drive()
+        if not has_creds and not drive:
+            speak("저장된 자료실 자격증명이 없습니다.")
+            wx.MessageBox(
+                "저장된 자료실 자격증명이 없습니다.\n로그아웃할 정보가 없습니다.",
+                "안내", wx.OK | wx.ICON_INFORMATION, self,
+            )
+            return
+
+        ans = wx.MessageBox(
+            "초록등대 자료실에서 로그아웃할까요?\n\n"
+            "마운트된 드라이브를 분리하고 저장된 자료실 아이디·비밀번호를\n"
+            "삭제합니다. 다음에 연결할 때 다시 입력해야 합니다.",
+            "초록등대 자료실 로그아웃",
+            wx.YES_NO | wx.ICON_QUESTION, self,
+        )
+        if ans != wx.YES:
+            return
+
+        try:
+            if drive:
+                unmount(drive)
+        except Exception:
+            pass
+        try:
+            delete_nas_credentials()
+        except Exception:
+            pass
+
+        speak("초록등대 자료실에서 로그아웃했습니다.")
+        wx.MessageBox(
+            "초록등대 자료실에서 로그아웃했습니다.",
+            "완료", wx.OK | wx.ICON_INFORMATION, self,
+        )
+
     def _activate_nas_menu(self):
         """초록등대 자료실 연결. rclone + WinFSP 기반."""
         try:
@@ -2015,6 +2681,164 @@ class MainFrame(wx.Frame):
             self.status_bar.SetStatusText("준비", 0)
 
         self._fetch_page(post.url, on_loaded)
+
+    def _download_post_attachments_from_list(self):
+        """게시물 목록에서 D 키로 호출. 현재 줄의 게시물 첨부파일을
+        모두 다운로드 폴더에 저장한다. 게시물 본문 창을 띄우지 않음.
+        """
+        if self.current_view != VIEW_POST_LIST:
+            return
+        index = self._get_current_line_index()
+        if index < 0 or index >= len(self.current_posts):
+            speak("선택된 게시물이 없습니다.")
+            return
+        post = self.current_posts[index]
+
+        speak(f"{post.title} 첨부파일을 확인하는 중입니다.")
+        self.status_bar.SetStatusText("첨부파일 확인 중...", 0)
+
+        def on_loaded(html, error):
+            self.status_bar.SetStatusText("준비", 0)
+            if error or not html:
+                speak("게시물을 불러올 수 없습니다.")
+                return
+            content = parse_post_content(html)
+            if not content:
+                speak("게시물 내용을 불러올 수 없습니다.")
+                return
+            files = getattr(content, "files", None) or []
+            if not files:
+                speak("이 게시물에는 첨부파일이 없습니다.")
+                wx.MessageBox(
+                    "이 게시물에는 첨부파일이 없습니다.",
+                    "안내", wx.OK | wx.ICON_INFORMATION, self,
+                )
+                return
+            self._download_files_to_folder(content, files)
+
+        self._fetch_page(post.url, on_loaded)
+
+    def _download_files_to_folder(self, content, files: list):
+        """주어진 첨부파일 목록을 백그라운드로 다운로드 폴더에 저장.
+
+        PostDialog.on_download_file 와 동일한 로직 — DAISY 자동 변환 안내까지
+        포함. 게시물 목록 D 단축키와 명령 도구 모음 등에서 공유.
+        """
+        from config import get_download_dir
+        try:
+            from sound import play_event
+        except Exception:
+            play_event = None
+
+        download_dir = get_download_dir()
+        total = len(files)
+        speak(f"첨부파일 다운로드를 시작합니다. {total}개 파일")
+        if play_event:
+            try:
+                play_event("download_start")
+            except Exception:
+                pass
+
+        from post_dialog import PostDialog as _PD
+
+        def _beep(freq):
+            try:
+                import winsound
+                winsound.Beep(freq, 100)
+            except Exception:
+                pass
+
+        def worker():
+            success = 0
+            fail = 0
+            saved_paths: list[str] = []
+            for fi in files:
+                url = fi["url"]
+                raw_name = fi["name"]
+                clean_name = _PD._clean_filename(raw_name)
+                if not url.startswith("http"):
+                    url = f"{SORISEM_BASE_URL}{url}"
+                save_path = os.path.join(download_dir, clean_name)
+
+                dl_entry = {
+                    "name": clean_name, "size": 0,
+                    "downloaded": 0, "status": "다운로드 중",
+                }
+                download_list.append(dl_entry)
+
+                try:
+                    resp = self.session.get(url, stream=True, timeout=30)
+                    total_size = int(resp.headers.get("content-length", 0))
+                    dl_entry["size"] = total_size
+                    downloaded = 0
+                    last_pct = 0
+                    with open(save_path, "wb") as f:
+                        for chunk in resp.iter_content(8192):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            dl_entry["downloaded"] = downloaded
+                            if total_size > 0:
+                                pct = int(downloaded / total_size * 100)
+                                if pct >= last_pct + 10:
+                                    last_pct = (pct // 10) * 10
+                                    freq = 400 + last_pct * 6
+                                    _beep(freq)
+                    dl_entry["status"] = "완료"
+                    _beep(1200)
+                    success += 1
+                    saved_paths.append(save_path)
+                except Exception:
+                    dl_entry["status"] = "실패"
+                    fail += 1
+
+            if fail == 0:
+                wx.CallAfter(speak, f"첨부파일 다운로드가 완료되었습니다. {success}개 파일")
+            else:
+                wx.CallAfter(speak, f"다운로드 완료: 성공 {success}개, 실패 {fail}개")
+            if play_event:
+                try:
+                    play_event("download_complete")
+                except Exception:
+                    pass
+
+            # DAISY ZIP 자동 변환 안내 — PostDialog 와 동일한 흐름 재사용.
+            for path in saved_paths:
+                try:
+                    from daisy import is_daisy_zip
+                    if is_daisy_zip(path):
+                        wx.CallAfter(self._offer_daisy_for_path, path)
+                        break
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _offer_daisy_for_path(self, zip_path: str):
+        """DAISY ZIP 자동 변환 안내. 사용자가 수락하면 _convert_daisy_zip 호출."""
+        try:
+            from daisy import convert_zip_to_text
+        except Exception:
+            return
+        ans = wx.MessageBox(
+            "DAISY 도서로 보이는 ZIP 파일을 다운로드했습니다.\n"
+            "본문 텍스트로 변환할까요?",
+            "DAISY 도서 변환", wx.YES_NO | wx.ICON_QUESTION, self,
+        )
+        if ans != wx.YES:
+            return
+        try:
+            out_dir = convert_zip_to_text(zip_path)
+            speak("DAISY 도서 변환이 완료되었습니다.")
+            wx.MessageBox(
+                f"변환 결과 폴더:\n{out_dir}",
+                "DAISY 변환 완료", wx.OK | wx.ICON_INFORMATION, self,
+            )
+        except Exception as e:
+            speak("DAISY 변환에 실패했습니다.")
+            wx.MessageBox(
+                f"DAISY 변환에 실패했습니다.\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
 
     def on_go_back(self):
         if not self.navigation_stack:
@@ -2232,6 +3056,7 @@ class MainFrame(wx.Frame):
             dialog = WriteDialog(
                 self, self.session, bo_table,
                 existing_title=old_title, existing_body=old_body,
+                user_rank=self.current_user_rank,
             )
             # 수정 시 w=u, wr_id 추가
             dialog._edit_wr_id = wr_id
@@ -2416,6 +3241,21 @@ class MainFrame(wx.Frame):
             "안내", "관리", "검색", "회원", "main", "index",
             "body", "content", "페이지", "목록", "게시판",
             "공지사항", "자유게시판", "자료실", "자유",
+            # 게시판·클럽 페이지의 액션 버튼 텍스트 — 페이지 제목으로 부적합
+            "글쓰기", "쓰기", "답변", "답글", "수정", "삭제",
+            "이전", "다음", "처음", "마지막",
+            "더보기", "전체", "보기", "닫기", "취소",
+            "확인", "저장", "전송", "신청", "등록",
+            "위로", "아래로", "이동",
+            "댓글", "댓글쓰기", "추천", "비추천",
+            "스크랩", "공유", "프린트", "인쇄",
+            "관리자", "운영자",
+            # _show_sub_menu 의 header_noise 와 동기화
+            "게시판 관리", "게시판관리", "멀티업로드",
+            "img", "철머", "로그아웃", "돌아가기",
+            "소리샘 동사무소", "동사무소",
+            "회원가입", "마이페이지", "쪽지", "쪽지함",
+            "메일", "메일함", "알림", "구독",
         }
         fallback_lower = fallback.lower() if fallback else ""
 
@@ -2428,8 +3268,9 @@ class MainFrame(wx.Frame):
                 return False
             if not re.search(r'[가-힣a-zA-Z]', t):
                 return False
-            # "N. X" 또는 "N) X" 형식은 하위메뉴/게시판 항목 - 클럽 제목이 아님
-            if re.match(r'^\d+[\.\)]\s', t):
+            # "N. X" / "N) X" / "N X"(예: "2 페이지") 형식은 하위 메뉴 항목·
+            # 페이지 번호 링크 등 — 클럽/게시판 제목으로 부적합.
+            if re.match(r'^\d+\s*([\.\)]|\s|페이지|page|$)', t, re.IGNORECASE):
                 return False
             return True
 
@@ -2437,26 +3278,56 @@ class MainFrame(wx.Frame):
         # 예: <a href="/plugin/ar.club/?cl=hims">셀바스헬스케어(구) 힘스인터네셔널</a>
         # 주의: cl=hims 가 포함된 하위 게시판 URL(bo_table=xxx&cl=hims)은 제외
         if match_code:
-            candidates = []
+            # 우선순위 별 후보 보관 — strict 가 우선.
+            strict: list[str] = []      # /plugin/ar.club/?cl=CODE 정확 매칭
+            board_strict: list[str] = []  # /bbs/board.php?bo_table=CODE (글쓰기·답글 등 wr_id 제외)
+            loose: list[str] = []       # 그 외 cl=CODE 포함 링크 (mo=… 카테고리)
             for a in soup.find_all("a", href=True):
                 href = a.get("href", "")
-                # 1) 클럽 메인 페이지: cl=CODE 포함, bo_table 없음
-                is_club_main = (
-                    f"cl={match_code}" in href
-                    and "bo_table=" not in href
-                )
-                # 2) 게시판 메인 페이지: bo_table=CODE
-                is_board_main = f"bo_table={match_code}" in href
-                if not (is_club_main or is_board_main):
+                href_lower = href.lower()
+
+                # wr_id 가 있으면 게시물 본문 링크 — 제목으로 부적합
+                if "wr_id=" in href_lower:
                     continue
+
                 t = a.get_text(" ", strip=True)
                 if not t:
                     t = a.get("title", "").strip()
-                if _is_valid(t):
-                    candidates.append(t)
-            if candidates:
-                # 가장 긴(구체적인) 이름 선택
-                return max(candidates, key=len)
+                if not _is_valid(t):
+                    continue
+
+                # 페이지 번호 링크(`page=N`) 제외 — 텍스트가 "2", "3" 또는
+                # "2 페이지" 등 형식이라 클럽 제목으로 부적합.
+                if re.search(r"[?&]page=\d", href_lower):
+                    continue
+
+                # 1) 클럽 메인 (가장 신뢰: ar.club 플러그인 진입점)
+                if (
+                    "/plugin/ar.club/" in href_lower
+                    and f"cl={match_code}" in href_lower
+                    and "bo_table=" not in href_lower
+                ):
+                    strict.append(t)
+                    continue
+
+                # 2) 게시판 메인 — bo_table=CODE 가 정확히 들어 있고 wr_id 없음
+                if f"bo_table={match_code}" in href_lower:
+                    board_strict.append(t)
+                    continue
+
+                # 3) 카테고리 nav (mo=…&cl=CODE) — 본 페이지 내부의 sub-link 일 수
+                #    있어 부정확한 후보. 폴백으로만 사용.
+                if (
+                    f"cl={match_code}" in href_lower
+                    and "bo_table=" not in href_lower
+                ):
+                    loose.append(t)
+
+            # 우선순위에 따라 첫 후보를 채택. 길이 휴리스틱은 sub-link 가 더 긴
+            # 이름인 경우 클럽 본명을 가리는 부작용이 있어 "맨 처음" 으로 변경.
+            for bucket in (strict, board_strict, loose):
+                if bucket:
+                    return bucket[0]
 
         # 브레드크럼 탐색
         for sel in [
@@ -2556,33 +3427,39 @@ class MainFrame(wx.Frame):
         return fallback
 
     def _navigate_by_direct_code(self, code: str):
-        """사용자 입력 코드를 클럽 → 게시판 순서로 시도하여 이동한다."""
-        club_url = f"/plugin/ar.club/?cl={code}"
+        """사용자가 바로가기 대화상자에 입력한 코드로 이동.
+
+        v1.7 — 메뉴 클릭 흐름과 동일한 동작 보장:
+        sorisem 사이트 구조상 hims/xvsrd 같은 클럽은 단일 부모 hub 가 아니라
+        여러 카테고리 hub (`/?mo=potion`, `/?mo=prg`, `/plugin/ar.club/?cl=green`
+        등) 중 하나의 자식으로 등록되어 있다. 여러 후보 hub 의 HTML 을 순차로
+        가져와 각 `<a href>` 의 바로가기 코드가 입력 코드와 일치하면 그
+        sub-menu 의 실제 URL/이름으로 `_load_and_show` 를 호출한다.
+
+        모든 후보 hub 에서 못 찾으면 `/bbs/board.php?bo_table=CODE` 직접 호출
+        폴백. 그래도 없으면 "표시할 내용이 없습니다" 안내.
+        """
         board_url = f"/bbs/board.php?bo_table={code}"
-        # 간결한 안내: _load_and_show와 동일 패턴
-        self.status_bar.SetStatusText(f"{code} 로딩 중...", 0)
-        speak(f"{code} 로딩 중입니다.")
+        self.status_bar.SetStatusText(f"{code} 검색 중...", 0)
+        speak(f"{code} 검색 중입니다.")
 
-        def resolve_display_name(html, sub_menus) -> str:
-            """페이지 제목 추출. 실패 시 사용자가 입력한 코드 사용."""
+        code_lower = code.lower()
+
+        def resolve_display_name(html) -> str:
             display_name = self._extract_page_title(html, "", match_code=code)
-            if display_name:
-                return display_name
-            # 하위메뉴 첫 항목 폴백은 엉뚱한 결과(공지사항, FAQ 등)를
-            # 반환하여 혼란을 주므로 사용하지 않음 - 그냥 코드 반환
-            return code
+            return display_name or code
 
-        def render_from_html(html, tried_url, attempted_board: bool) -> bool:
+        def render_board(html, tried_url) -> bool:
             if not html or len(html) < 100:
+                return False
+            if (
+                'alert("게시판 접근권한이 없습니다' in html
+                or "<title>오류안내" in html
+            ):
                 return False
             posts = parse_board_list(html)
             sub_menus = parse_sub_menus(html, base_url=tried_url)
-            display_name = resolve_display_name(html, sub_menus)
-            # 클럽 URL (ar.club 플러그인)이면 하위메뉴 우선
-            is_club_url = "ar.club" in tried_url
-            if is_club_url and sub_menus:
-                self._show_sub_menu(sub_menus, display_name, base_url=tried_url)
-                return True
+            display_name = resolve_display_name(html)
             if posts:
                 self.current_board_url = tried_url
                 self._show_post_list(posts, display_name, tried_url, 1)
@@ -2590,7 +3467,7 @@ class MainFrame(wx.Frame):
             if sub_menus:
                 self._show_sub_menu(sub_menus, display_name, base_url=tried_url)
                 return True
-            if "bo_table=" in tried_url and attempted_board:
+            if "bo_table=" in tried_url:
                 self.current_board_url = tried_url
                 self.current_view = VIEW_POST_LIST
                 self.current_posts = []
@@ -2605,16 +3482,116 @@ class MainFrame(wx.Frame):
             return False
 
         def on_board_loaded(html, error):
-            if error or not render_from_html(html, board_url, attempted_board=True):
+            if error or not render_board(html, board_url):
                 speak("표시할 내용이 없습니다.")
                 self.status_bar.SetStatusText("준비", 0)
 
-        def on_club_loaded(html, error):
-            if not error and render_from_html(html, club_url, attempted_board=False):
-                return
-            self._fetch_page(board_url, on_board_loaded)
+        # 후보 부모 hub 목록 — sorisem 의 주요 카테고리/클럽 hub.
+        # 일반 클럽(hims, xvsrd 등) 은 `/?mo=potion` (동호회) 아래에 가장
+        # 흔히 등록되어 있어 후순위에 둔다. green 은 가장 빈번한 케이스라 우선.
+        candidate_hubs = [
+            "/plugin/ar.club/?cl=green",
+            "/?mo=potion&cl=potion",
+            "/?mo=prg&cl=prg",
+            "/?mo=pds&cl=pds",
+            "/?mo=magazin&cl=magazin",
+            "/?mo=lib2013&cl=lib2013",
+            "/?mo=edu2013&cl=edu2013",
+            "/?mo=braille",
+        ]
 
-        self._fetch_page(club_url, on_club_loaded)
+        def search_in_hubs():
+            """각 후보 hub 의 HTML 을 순차 GET → 코드 매칭 검색.
+
+            발견 시 (href, text) 튜플 반환. 못 찾으면 (None, None).
+            진단용으로 모든 hub 응답을 `data/goto_hub_<safe>.html` 로 dump.
+            """
+            from bs4 import BeautifulSoup as _BS
+            from menu_manager import extract_shortcut_code
+            try:
+                from config import DATA_DIR
+                import os as _os
+                _os.makedirs(DATA_DIR, exist_ok=True)
+            except Exception:
+                DATA_DIR = None
+
+            target_patterns = (
+                f"cl={code_lower}",
+                f"bo_table={code_lower}",
+                f"mo={code_lower}",
+            )
+
+            for hub in candidate_hubs:
+                try:
+                    full = (
+                        hub if hub.startswith("http")
+                        else f"{SORISEM_BASE_URL}{hub}"
+                    )
+                    resp = self.session.get(full, timeout=15)
+                    html = resp.text
+                except Exception:
+                    continue
+
+                # 진단 dump
+                if DATA_DIR:
+                    try:
+                        safe = re.sub(r"[^A-Za-z0-9]+", "_", hub)[:50]
+                        with open(
+                            os.path.join(DATA_DIR, f"goto_hub_{safe}.html"),
+                            "w", encoding="utf-8",
+                        ) as _f:
+                            _f.write(html)
+                    except Exception:
+                        pass
+
+                if not html or len(html) < 100:
+                    continue
+
+                try:
+                    soup = _BS(html, "html.parser")
+                except Exception:
+                    continue
+
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    href_low = href.lower()
+                    if not href or "wr_id=" in href_low:
+                        continue
+
+                    # 1) extract_shortcut_code 로 정확 매칭
+                    sm_code = (extract_shortcut_code(href) or "").lower()
+                    matched = (sm_code == code_lower)
+
+                    # 2) URL 안에 코드가 있는 query param 으로 매칭 (보조)
+                    if not matched:
+                        matched = any(p in href_low for p in target_patterns)
+
+                    if matched:
+                        text = a.get_text(" ", strip=True)
+                        if not text:
+                            text = a.get("title", "").strip()
+                        if not text:
+                            continue
+                        return href, text
+            return None, None
+
+        def worker():
+            try:
+                match_url, match_name = search_in_hubs()
+            except Exception:
+                match_url, match_name = None, None
+
+            if match_url:
+                wx.CallAfter(self.status_bar.SetStatusText, "준비", 0)
+                wx.CallAfter(
+                    self._load_and_show, match_url, match_name or code,
+                )
+                return
+
+            # 후보 hub 에서 매칭 실패 — 게시판 URL 직접 시도.
+            wx.CallAfter(self._fetch_page, board_url, on_board_loaded)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── 다운로드 상태 (Ctrl+J) ──
 
@@ -2775,6 +3752,31 @@ class MainFrame(wx.Frame):
             speak(f"파일을 열 수 없습니다. {e}")
             wx.MessageBox(
                 f"파일을 열 수 없습니다.\n경로: {MENU_LIST_TXT_FILE}\n{e}",
+                "오류", wx.OK | wx.ICON_ERROR, self,
+            )
+
+    def on_edit_reply_templates(self, event=None):
+        """v1.7 — 답장 템플릿 파일을 기본 편집기로 연다.
+
+        파일이 없으면 기본 템플릿으로 자동 생성한 뒤 연다. 사용자가 저장하면
+        다음에 댓글 입력창에서 Alt+1~9 가 새 내용을 사용한다 (별도 reload 불필요).
+        """
+        from config import REPLY_TEMPLATES_FILE
+        from reply_templates import load_templates  # 자동 생성 트리거
+        try:
+            load_templates()  # 파일이 없으면 기본값으로 생성
+        except Exception:
+            pass
+        if not os.path.exists(REPLY_TEMPLATES_FILE):
+            speak("답장 템플릿 파일을 찾을 수 없습니다.")
+            return
+        try:
+            os.startfile(REPLY_TEMPLATES_FILE)
+            speak("답장 템플릿 파일을 엽니다. 한 줄에 하나씩 적고 저장하세요.")
+        except OSError as e:
+            speak(f"파일을 열 수 없습니다. {e}")
+            wx.MessageBox(
+                f"파일을 열 수 없습니다.\n경로: {REPLY_TEMPLATES_FILE}\n{e}",
                 "오류", wx.OK | wx.ICON_ERROR, self,
             )
 
@@ -3747,6 +4749,7 @@ class MainFrame(wx.Frame):
             "Alt+M: 게시물 수정",
             "Alt+D / Delete: 게시물 삭제",
             "Alt+R: 게시물 답변",
+            "D: 첨부파일 즉시 다운로드 (게시물 목록에서, 본문 창을 열지 않음)  — v1.7",
             "",
             "=== 게시물 본문 ===",
             "Enter: 커서 위치의 URL을 브라우저에서 열기",
@@ -3827,14 +4830,15 @@ class MainFrame(wx.Frame):
             "Ctrl+-: 글꼴 작게 (축소)",
             "Ctrl+0: 글꼴 크기 원래대로",
             "",
-            "=== v1.6 신규 기능 ===",
-            "· 단일 인스턴스 실행 (중복 실행 시 안내)",
-            "· 메일·쪽지 실시간 알림 \"즉시\"(1초) 옵션 — 기본값",
-            "· 시작 시 미확인 메일·쪽지 자동 안내",
-            "· 메일·쪽지 읽음 상태가 제목 표시줄·목록에 즉시 반영",
-            "· 사용자 편집 메뉴 파일(data/menu_list.txt) 지원",
-            "· 자동 메뉴 감지 — 사이트 메뉴 변경에 자동 대응",
-            "· 자동 업데이트 안정화 — GitHub API rate limit 시 HTML 폴백",
+            "=== v1.7 단축키 ===",
+            "Ctrl+B: 즐겨찾기 열기",
+            "Ctrl+D: 현재 위치를 즐겨찾기에 추가",
+            "Ctrl+P: 명령 도구 모음 (모든 기능을 키워드로 검색·실행)",
+            "Ctrl+Shift+S: 현재 게시판 구독 / 구독 해제",
+            "Ctrl+Alt+L: 구독 목록 보기",
+            "Ctrl+Alt+D: DAISY 도서 변환 대화상자 열기",
+            "D: 게시물 목록에서 첨부파일 즉시 다운로드",
+            "Alt+1 ~ Alt+9: 댓글 입력창에서 빠른 답장 템플릿 삽입",
         ]
 
         dlg = wx.Dialog(self, title="단축키 안내", size=(450, 500),
@@ -3867,6 +4871,427 @@ class MainFrame(wx.Frame):
             speak("메일 대화상자 호출 중 오류가 발생했습니다.")
             wx.MessageBox(f"메일 대화상자 호출 중 오류가 발생했습니다.\n{e}",
                           "오류", wx.OK | wx.ICON_ERROR, self)
+
+    # ── v1.7 즐겨찾기 ──
+
+    def on_add_bookmark(self, event=None):
+        """Ctrl+D — 현재 위치를 즐겨찾기에 추가.
+
+        화면별 동작:
+          · 메인 메뉴: 현재 커서가 있는 메뉴 항목
+          · 하위 메뉴: 현재 커서가 있는 하위 메뉴 항목 (상위 메뉴 X)
+          · 게시판 글 목록: 현재 게시판 자체
+        """
+        url = ""
+        suggested = ""
+        type_hint = "board"
+
+        if self.current_view == VIEW_MAIN_MENU:
+            idx = getattr(self, "current_index", 0)
+            menu_item = self.menu_manager.get_menu_by_index(idx)
+            if menu_item:
+                url = menu_item.url
+                suggested = re.sub(r"^\s*\d+[\.\)]\s*", "", menu_item.name).strip()
+                type_hint = menu_item.type or "board"
+            else:
+                speak("현재 항목을 알 수 없어 즐겨찾기에 추가하지 못했습니다.")
+                return
+        elif self.current_view == VIEW_SUB_MENU:
+            # current_index 는 textctrl 줄 번호. 0 번 줄은 "메인 메뉴로 돌아가기" 안내,
+            # 1 번 줄부터가 실제 하위 메뉴 항목 (current_sub_menus[0]).
+            idx = getattr(self, "current_index", 0)
+            actual = idx - 1
+            sub_items = getattr(self, "current_sub_menus", []) or []
+            if 0 <= actual < len(sub_items):
+                sub = sub_items[actual]
+                url = sub.url if not sub.url.startswith("http") or SORISEM_BASE_URL in sub.url else sub.url
+                # 사이트 내부 URL 은 상대 경로로 정규화
+                if url.startswith("http") and SORISEM_BASE_URL in url:
+                    url = url.replace(SORISEM_BASE_URL, "")
+                suggested = re.sub(r"^\s*\d+[\.\)]\s*", "", sub.name).strip()
+                type_hint = "board"
+            else:
+                # 안내 줄이거나 잘못된 인덱스 — 안내
+                speak("저장할 하위 메뉴 항목을 선택해 주세요.")
+                wx.MessageBox(
+                    "즐겨찾기에 추가하려는 하위 메뉴 항목 위에 커서를 두고 "
+                    "다시 Ctrl+D 를 눌러 주세요.",
+                    "선택 필요",
+                    wx.OK | wx.ICON_INFORMATION, self,
+                )
+                return
+        elif self.current_view == VIEW_POST_LIST and self.current_board_url:
+            url = self.current_board_url
+            suggested = re.sub(
+                r"^\s*\d+[\.\)]\s*", "", self.current_menu_name or "게시판",
+            ).strip()
+            type_hint = "board"
+        else:
+            speak("현재 화면은 즐겨찾기에 추가할 수 없습니다.")
+            wx.MessageBox(
+                "지금 화면은 즐겨찾기에 추가할 수 없습니다.\n"
+                "메인 메뉴·하위 메뉴 항목 위에서 다시 시도해 주세요.",
+                "즐겨찾기 추가 불가",
+                wx.OK | wx.ICON_INFORMATION, self,
+            )
+            return
+
+        if not url:
+            speak("주소 정보를 알 수 없어 즐겨찾기에 추가하지 못했습니다.")
+            return
+
+        dlg = wx.TextEntryDialog(
+            self, "즐겨찾기 이름을 입력하세요.", "즐겨찾기 추가",
+            value=suggested,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            name = dlg.GetValue().strip()
+        finally:
+            dlg.Destroy()
+        if not name:
+            return
+
+        added = self.bookmark_manager.add(name, url, type_hint)
+        if added:
+            speak(f"즐겨찾기에 추가했습니다. {name}")
+        else:
+            speak(f"이미 등록된 즐겨찾기 이름을 갱신했습니다. {name}")
+
+    def on_open_bookmarks(self, event=None):
+        """즐겨찾기 대화상자 열기 (Ctrl+B). 선택 시 해당 URL 로 바로 진입."""
+        from bookmark_dialog import BookmarkDialog
+        dlg = BookmarkDialog(self, self.bookmark_manager)
+        code = dlg.ShowModal()
+        url = dlg.selected_url
+        name = dlg.selected_name
+        dlg.Destroy()
+        if code == wx.ID_OK and url:
+            speak(f"{name} 로 이동합니다.")
+            self._load_and_show(url, name)
+
+    # ── v1.7 명령 도구 모음 ──
+
+    def on_open_command_palette(self, event=None):
+        """Ctrl+P — 모든 명령을 키워드로 검색·실행."""
+        from command_palette import CommandPaletteDialog, Command
+        cmds = self._build_command_list()
+        dlg = CommandPaletteDialog(self, cmds)
+        code = dlg.ShowModal()
+        cmd = getattr(dlg, "selected_command", None)
+        dlg.Destroy()
+        if code == wx.ID_OK and cmd is not None:
+            try:
+                cmd.callback()
+            except Exception as e:
+                speak(f"명령 실행 중 오류가 발생했습니다.")
+                wx.MessageBox(f"명령 실행 실패: {e}", "오류",
+                              wx.OK | wx.ICON_ERROR, self)
+
+    def _build_command_list(self):
+        """명령 도구 모음에 표시할 모든 명령 목록 구성."""
+        from command_palette import Command
+        cmds: list[Command] = []
+        cmds.append(Command(
+            "메인 메뉴로 이동", "처음 화면으로 돌아갑니다", "Alt+Home",
+            lambda: (self._show_main_menu(), speak("메인 메뉴로 돌아왔습니다.")),
+        ))
+        cmds.append(Command(
+            "즐겨찾기 열기", "저장한 즐겨찾기 목록을 봅니다", "Ctrl+B",
+            self.on_open_bookmarks,
+        ))
+        cmds.append(Command(
+            "현재 위치를 즐겨찾기에 추가", "현재 화면을 즐겨찾기로 저장", "Ctrl+D",
+            self.on_add_bookmark,
+        ))
+        cmds.append(Command(
+            "현재 게시판 구독 토글", "새 글이 올라오면 알림으로 받기", "Ctrl+Shift+S",
+            self.on_toggle_subscription,
+        ))
+        cmds.append(Command(
+            "구독 목록 보기", "구독 중인 게시판 관리", "",
+            self.on_open_subscriptions,
+        ))
+        cmds.append(Command(
+            "쪽지함 열기", "받은·보낸 쪽지 목록", "Ctrl+M",
+            lambda: self.on_open_memo_inbox(None),
+        ))
+        cmds.append(Command(
+            "쪽지 쓰기", "새 쪽지 작성", "Ctrl+Shift+M",
+            lambda: self.on_open_memo_compose(None),
+        ))
+        cmds.append(Command(
+            "메일함 열기", "받은·보낸 메일 목록", "Ctrl+Shift+E",
+            lambda: self.on_open_mail_compose(None),
+        ))
+        cmds.append(Command(
+            "관리자에게 메일 보내기", "관리자 메일 작성", "Alt+E",
+            lambda: self.on_mail(None),
+        ))
+        cmds.append(Command(
+            "알림 센터 열기", "새 메일·쪽지·게시판 글 모음", "Ctrl+Shift+N",
+            lambda: self.on_memo_check_now(None),
+        ))
+        cmds.append(Command(
+            "초록등대 자료실 연결", "NAS 마운트", "Ctrl+N",
+            lambda: self._on_menu_nas_connect(None),
+        ))
+        cmds.append(Command(
+            "DAISY 도서 변환", "ZIP 으로 받은 DAISY 도서를 압축 해제 + TXT 변환", "",
+            self.on_convert_daisy,
+        ))
+        cmds.append(Command(
+            "다운로드 상태", "현재 다운로드 진행 상황", "Ctrl+J",
+            lambda: self.on_download_status(None),
+        ))
+        cmds.append(Command(
+            "게시물 검색", "현재 게시판에서 검색", "Ctrl+F",
+            self.on_search,
+            when=lambda: self.current_view == VIEW_POST_LIST,
+        ))
+        cmds.append(Command(
+            "게시판 새로고침", "현재 게시판 다시 로드", "F5",
+            self.on_board_refresh,
+            when=lambda: self.current_view == VIEW_POST_LIST,
+        ))
+        cmds.append(Command(
+            "게시물 작성", "새 글 쓰기", "W",
+            self._write_post,
+            when=lambda: self.current_view == VIEW_POST_LIST,
+        ))
+        cmds.append(Command(
+            "단축키 안내", "전체 단축키 목록", "Ctrl+K",
+            lambda: self.on_shortcuts_help(None),
+        ))
+        cmds.append(Command(
+            "사용자 설명서", "전체 설명서 보기", "Shift+F1",
+            lambda: self.on_show_manual(None),
+        ))
+        cmds.append(Command(
+            "설정", "테마·글꼴·알림 등 설정", "F7",
+            lambda: self.on_show_settings(None),
+        ))
+        cmds.append(Command(
+            "업데이트 확인", "최신 버전 수동 확인", "Alt+U",
+            lambda: self.on_manual_update_check(None),
+        ))
+        cmds.append(Command(
+            "로그아웃", "현재 계정 로그아웃", "Ctrl+L",
+            lambda: self.on_logout(None),
+        ))
+        return cmds
+
+    # ── v1.7 게시판 구독 ──
+
+    def on_toggle_subscription(self, event=None):
+        """현재 게시판을 구독/구독 해제 (Ctrl+Shift+S).
+
+        구독 중이면 해제, 아니면 새로 구독. 게시판 글 목록 화면에서만 동작.
+        """
+        if self.current_view != VIEW_POST_LIST or not self.current_board_url:
+            speak("이 화면에서는 구독을 토글할 수 없습니다. 게시판 글 목록에서 다시 시도해 주세요.")
+            wx.MessageBox(
+                "구독은 게시판 글 목록 화면에서만 토글할 수 있습니다.",
+                "구독 불가", wx.OK | wx.ICON_INFORMATION, self,
+            )
+            return
+
+        url = self.current_board_url
+        name = re.sub(r"^\s*\d+[\.\)]\s*", "",
+                      self.current_menu_name or "게시판").strip()
+        mgr = self._ensure_subscription_manager()
+        if mgr is None:
+            return
+        existing = mgr.find(url)
+        if existing:
+            mgr.remove(url)
+            speak(f"{name} 구독을 해제했습니다.")
+            wx.MessageBox(f"{name} 구독을 해제했습니다.",
+                          "구독 해제", wx.OK | wx.ICON_INFORMATION, self)
+        else:
+            mgr.add(name, url)
+            # 처음 추가된 구독은 seen 이 비어 있으니 백그라운드로 채워둠.
+            mgr.initial_fill_async()
+            speak(f"{name} 을(를) 구독했습니다. 새 글이 올라오면 알림 센터에 표시됩니다.")
+            wx.MessageBox(
+                f"{name} 을(를) 구독했습니다.\n"
+                "이후 올라오는 새 글이 알림 센터(Ctrl+Shift+N)에 표시됩니다.",
+                "구독 추가", wx.OK | wx.ICON_INFORMATION, self,
+            )
+
+    def on_open_subscriptions(self, event=None):
+        """구독 목록 대화상자 — 간단히 ListBox + 해제 버튼."""
+        mgr = self._ensure_subscription_manager()
+        if mgr is None:
+            return
+        if not mgr.items:
+            speak("구독 중인 게시판이 없습니다.")
+            wx.MessageBox(
+                "구독 중인 게시판이 없습니다.\n"
+                "게시판 글 목록 화면에서 Ctrl+Shift+S 로 구독을 추가하실 수 있습니다.",
+                "구독 없음", wx.OK | wx.ICON_INFORMATION, self,
+            )
+            return
+
+        dlg = wx.SingleChoiceDialog(
+            self,
+            "구독 중인 게시판입니다. 해제할 게시판을 선택하고 확인을 누르면 해제됩니다.",
+            "구독 목록",
+            [f"{s.name}    ({s.url})" for s in mgr.items],
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            sel = dlg.GetSelection()
+        finally:
+            dlg.Destroy()
+        if sel < 0 or sel >= len(mgr.items):
+            return
+        target = mgr.items[sel]
+        ans = wx.MessageBox(f"'{target.name}' 구독을 해제할까요?",
+                            "구독 해제 확인",
+                            wx.YES_NO | wx.ICON_QUESTION, self)
+        if ans == wx.YES:
+            mgr.remove(target.url)
+            speak("구독을 해제했습니다.")
+
+    def _ensure_subscription_manager(self):
+        """구독 매니저를 lazy 생성. 이미 있으면 그대로 반환.
+
+        설정값(`subscription_interval_sec`, `check_subscriptions`) 을 읽어
+        타이머 주기를 정한다. 사용 안 함이면 매니저는 만들되 타이머는 안 돈다.
+        """
+        if self._subscription_manager is not None:
+            return self._subscription_manager
+        if not self.session:
+            return None
+        try:
+            from subscriptions import SubscriptionManager
+            self._subscription_manager = SubscriptionManager(
+                self, self.session, self._on_new_subscription_posts,
+            )
+            self._subscription_manager.initial_fill_async()
+            self._restart_subscription_timer()
+        except Exception:
+            self._subscription_manager = None
+        return self._subscription_manager
+
+    def _restart_subscription_timer(self):
+        """설정에 따라 구독 폴링 타이머를 재시작/중단."""
+        try:
+            if getattr(self, "_subscription_timer", None):
+                self._subscription_timer.Stop()
+        except Exception:
+            pass
+        try:
+            from settings_dialog import load_notify_settings
+            settings = load_notify_settings()
+            if not bool(settings.get("check_subscriptions", True)):
+                return
+            interval = max(1, int(settings.get("subscription_interval_sec", 10)))
+            self._subscription_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_subscription_tick,
+                      self._subscription_timer)
+            self._subscription_timer.Start(interval * 1000)
+        except Exception:
+            pass
+
+    def _on_subscription_tick(self, event):
+        if self._subscription_manager is not None:
+            self._subscription_manager.poll_once_async()
+
+    def _on_new_subscription_posts(self, board_name: str, new_posts: list):
+        """구독 게시판에 새 글 도착 — 알림 센터 등록 + 사운드/TTS."""
+        if not new_posts:
+            return
+        try:
+            from notification import NotificationItem, get_center
+            center = get_center()
+            to_add = [
+                NotificationItem(
+                    type="post",
+                    item_id=str(getattr(p, "url", "")),
+                    sender=board_name,
+                    summary=getattr(p, "title", "") or "(제목 없음)",
+                    timestamp=getattr(p, "date", ""),
+                    extra=p,
+                ) for p in new_posts
+            ]
+            center.add_many(to_add)
+        except Exception:
+            pass
+        # 모달 사용 중이면 소리·TTS 억제 (메일·쪽지 알림과 동일 정책)
+        if self._is_modal_dialog_open():
+            return
+        try:
+            from sound import play_event
+            play_event("memo_new")
+        except Exception:
+            pass
+        n = len(new_posts)
+        if n == 1:
+            speak(f"{board_name} 게시판에 새 글이 올라왔습니다. {new_posts[0].title}")
+        else:
+            speak(f"{board_name} 게시판에 새 글 {n}개가 올라왔습니다.")
+
+    # ── v1.7 DAISY 변환 ──
+
+    def on_convert_daisy(self, event=None):
+        """DAISY 도서 ZIP 을 선택해 압축 해제 + TXT 변환."""
+        dlg = wx.FileDialog(
+            self, "DAISY 도서 ZIP 파일 선택",
+            wildcard="ZIP 파일 (*.zip)|*.zip|모든 파일 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        )
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            zip_path = dlg.GetPath()
+        finally:
+            dlg.Destroy()
+
+        from daisy import is_daisy_zip, convert_zip_to_text
+        if not is_daisy_zip(zip_path):
+            speak("DAISY 도서가 아닌 것 같습니다.")
+            ans = wx.MessageBox(
+                "선택한 파일이 DAISY 도서로 판정되지 않았습니다.\n"
+                "(.opf / .ncx / DTBook XML 이 들어 있어야 합니다)\n\n"
+                "그래도 압축 해제하고 변환을 시도할까요?",
+                "DAISY 아님", wx.YES_NO | wx.ICON_QUESTION, self,
+            )
+            if ans != wx.YES:
+                return
+
+        speak("DAISY 도서를 변환하는 중입니다.")
+        try:
+            result = convert_zip_to_text(zip_path)
+        except Exception as e:
+            speak("DAISY 변환에 실패했습니다.")
+            wx.MessageBox(f"변환 중 오류가 발생했습니다.\n{e}",
+                          "변환 실패", wx.OK | wx.ICON_ERROR, self)
+            return
+        if result is None:
+            speak("DTBook 본문을 찾지 못해 변환에 실패했습니다.")
+            wx.MessageBox(
+                "압축은 풀었지만 본문 XML 을 찾지 못해 TXT 변환이 어렵습니다.\n"
+                "압축 해제된 폴더를 직접 확인해 주세요.",
+                "변환 실패", wx.OK | wx.ICON_ERROR, self,
+            )
+            return
+        folder, txt_path = result
+        speak(f"변환 완료. 텍스트 파일은 {os.path.basename(txt_path)} 입니다.")
+        ans = wx.MessageBox(
+            f"DAISY 도서 변환을 마쳤습니다.\n\n"
+            f"폴더: {folder}\n파일: {txt_path}\n\n"
+            "폴더를 탐색기로 열어 보시겠습니까?",
+            "변환 완료", wx.YES_NO | wx.ICON_INFORMATION, self,
+        )
+        if ans == wx.YES:
+            try:
+                os.startfile(folder)
+            except Exception:
+                pass
 
     def on_open_memo_inbox(self, event):
         """도구 > 쪽지함 열기 (Ctrl+M)."""
@@ -4034,6 +5459,12 @@ class MainFrame(wx.Frame):
             self._memo_notifier = None
             self._mail_notifier = None
 
+        # v1.7 — 게시판 구독도 함께 시작 (사용자가 구독 항목을 가지고 있을 때만 의미)
+        try:
+            self._ensure_subscription_manager()
+        except Exception:
+            pass
+
     def _on_mail_tick(self, event):
         """메일 폴링 tick — 새 메일이 있으면 알림 센터에 추가 + 알림."""
         if not getattr(self, "_mail_notifier", None):
@@ -4107,7 +5538,10 @@ class MainFrame(wx.Frame):
         return False
 
     def restart_memo_notifier(self):
-        """설정 변경 후 호출 — 기존 타이머 중단 후 새 주기로 재시작."""
+        """설정 변경 후 호출 — 기존 타이머 중단 후 새 주기로 재시작.
+
+        v1.7 — 게시판 구독 타이머도 같이 재시작한다.
+        """
         try:
             if getattr(self, "_memo_notifier", None):
                 self._memo_notifier.stop()
@@ -4122,6 +5556,9 @@ class MainFrame(wx.Frame):
         self._mail_notifier = None
         self._mail_timer = None
         self._start_memo_notifier()
+        # 구독 타이머도 새 주기로 재시작
+        if getattr(self, "_subscription_manager", None):
+            self._restart_subscription_timer()
 
     def _on_new_memo(self, count: int, new_items: list):
         """새 쪽지 도착 콜백 — 알림 센터에 등록 + 사운드·TTS·제목바 업데이트.

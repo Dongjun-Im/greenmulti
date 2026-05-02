@@ -13,7 +13,8 @@ class WriteDialog(wx.Dialog):
     """게시물 작성 대화상자"""
 
     def __init__(self, parent, session: requests.Session, bo_table: str,
-                 existing_title: str = "", existing_body: str = ""):
+                 existing_title: str = "", existing_body: str = "",
+                 user_rank: str | None = None):
         super().__init__(
             parent, title="게시물 작성",
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
@@ -24,6 +25,12 @@ class WriteDialog(wx.Dialog):
         self.bo_table = bo_table
         self.attached_files: list[str] = []  # 첨부파일 경로 목록
         self._is_edit_mode = bool(existing_title or existing_body)
+        # 동호회 관리자 등급(또는 클럽 관리자) 인 경우에만 공지 체크박스 노출.
+        # rank 텍스트는 green_auth.authenticator 가 회원 목록 페이지에서 추출한
+        # 그대로(예: "동호회관리자", "동호회 관리자", "클럽관리자") 들어온다.
+        self._is_admin = bool(
+            user_rank and ("관리자" in user_rank)
+        )
 
         self._create_controls()
         self._do_layout()
@@ -65,6 +72,14 @@ class WriteDialog(wx.Dialog):
             self.panel, name="제목",
         )
 
+        # 공지 체크박스 — 동호회 관리자만 노출.
+        if self._is_admin:
+            self.notice_checkbox = wx.CheckBox(
+                self.panel, label="공지로 등록(&O)", name="공지로 등록",
+            )
+        else:
+            self.notice_checkbox = None
+
         # 본문
         self.body_label = wx.StaticText(self.panel, label="본문(&B):")
         self.body_input = wx.TextCtrl(
@@ -92,6 +107,12 @@ class WriteDialog(wx.Dialog):
         # 제목
         main_sizer.Add(self.title_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
         main_sizer.Add(self.title_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        # 공지 체크박스 — 관리자에게만
+        if self.notice_checkbox is not None:
+            main_sizer.Add(
+                self.notice_checkbox, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10,
+            )
 
         # 본문
         main_sizer.Add(self.body_label, 0, wx.LEFT | wx.RIGHT, 10)
@@ -212,6 +233,17 @@ class WriteDialog(wx.Dialog):
                 elif is_reply:
                     data["wr_id"] = self._reply_wr_id
 
+                # 공지 체크박스 처리.
+                # gnuboard5 와 ar.club 플러그인은 버전·테마에 따라 필드명이 다른
+                # 사례가 있다 — write 폼을 GET 해서 실제 form 안의 "notice" 류
+                # input 이름들을 추출하고 모두 함께 POST 한다. 추출 실패 시에도
+                # 알려진 표준 필드명들을 폴백으로 모두 실어 둔다.
+                if (
+                    self.notice_checkbox is not None
+                    and self.notice_checkbox.GetValue()
+                ):
+                    self._apply_notice_fields(data, w_mode, is_reply)
+
                 files_data = {}
                 for i, path in enumerate(self.attached_files):
                     key = f"bf_file[{i}]"
@@ -234,6 +266,72 @@ class WriteDialog(wx.Dialog):
                 wx.CallAfter(self._submit_error, str(e))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_notice_fields(self, data: dict, w_mode: str, is_reply: bool) -> None:
+        """write 폼의 실제 notice 필드를 추출해 data 에 병합.
+
+        먼저 write.php?bo_table=... 를 GET 해 form 의 모든 `<input>` 중 name 에
+        "notice" 가 들어 있는 것의 이름을 수집한다. 이름별 적절한 값을 결정하고
+        data 에 병합. 실패 시 gnuboard5 의 표준 후보 필드들을 폴백으로 모두 채운다.
+        진단을 위해 첫 호출 시 폼 HTML 을 `data/write_form_<bo>.html` 로 dump.
+        """
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            BeautifulSoup = None
+
+        # 답변·수정 모드에 맞는 write.php URL.
+        get_url = f"{SORISEM_BASE_URL}/bbs/write.php?bo_table={self.bo_table}"
+        if w_mode == "r" and getattr(self, "_reply_wr_id", None):
+            get_url += f"&wr_id={self._reply_wr_id}&w=r"
+        elif w_mode == "u" and getattr(self, "_edit_wr_id", None):
+            get_url += f"&wr_id={self._edit_wr_id}&w=u"
+
+        notice_field_names: list[str] = []
+        try:
+            resp = self.session.get(get_url, timeout=15)
+            html = resp.text or ""
+            try:
+                from config import DATA_DIR
+                os.makedirs(DATA_DIR, exist_ok=True)
+                safe = self.bo_table.replace("/", "_")[:40]
+                with open(
+                    os.path.join(DATA_DIR, f"write_form_{safe}.html"),
+                    "w", encoding="utf-8",
+                ) as _wf:
+                    _wf.write(html)
+            except Exception:
+                pass
+            if BeautifulSoup is not None and html:
+                soup = BeautifulSoup(html, "html.parser")
+                for inp in soup.find_all(["input", "select"]):
+                    name = (inp.get("name") or "").strip()
+                    name_low = name.lower()
+                    if "notice" in name_low or "공지" in name:
+                        if name and name not in notice_field_names:
+                            notice_field_names.append(name)
+        except Exception:
+            pass
+
+        # 실제 폼에서 발견된 필드는 그대로 채운다.
+        # gnuboard 컨벤션:
+        #   · "notice_check"  → value 는 bo_table (관리자 게시판에서 공지로 지정)
+        #   · "notice"        → value 는 보통 "1" 또는 wr_id
+        #   · "chk_notice"    → "1"
+        #   · "wr_notice"     → "1"
+        for name in notice_field_names:
+            n_low = name.lower()
+            if n_low in ("notice_check",):
+                data[name] = self.bo_table
+            else:
+                data[name] = "1"
+
+        # 폴백: 폼에서 못 찾았더라도 알려진 후보를 모두 실어 둔다.
+        if not notice_field_names:
+            data.setdefault("chk_notice", "1")
+            data.setdefault("notice_check", self.bo_table)
+            data.setdefault("wr_notice", "1")
+            data.setdefault("notice", "1")
 
     def _submit_done(self, status_code: int):
         if self._is_edit_mode:

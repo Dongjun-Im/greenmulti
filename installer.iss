@@ -1,12 +1,12 @@
-﻿; 초록멀티 v1.6 — Inno Setup 설치 스크립트
+﻿; 초록멀티 v1.7 — Inno Setup 설치 스크립트
 ; 빌드: ISCC.exe installer.iss
 
 #define AppName "초록멀티"
-#define AppVersion "1.6.6"
-#define AppVersionDisplay "v1.6"
+#define AppVersion "1.7.0"
+#define AppVersionDisplay "v1.7"
 #define AppPublisher "초록등대 동호회"
-#define AppExeName "초록멀티 v1.6.exe"
-#define AppDistName "초록멀티 v1.6"
+#define AppExeName "초록멀티 v1.7.exe"
+#define AppDistName "초록멀티 v1.7"
 
 [Setup]
 ; AppId 는 절대 바꾸지 말 것 — 고정 GUID 로 유지해야 같은 제품으로 인식되어
@@ -27,7 +27,7 @@ OutputDir=installer_out
 ; 빌드 시에는 ASCII 안전한 이름으로 저장하고, 워크플로의 후속 단계에서
 ; Python 으로 한글 접두사를 붙여 리네임한다 (Windows runner 의 PowerShell·
 ; ISCC 인코딩 처리에서 한글이 잘려 나가는 문제를 우회).
-OutputBaseFilename=greenmulti_v1.6_setup
+OutputBaseFilename=greenmulti_v1.7_setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -67,22 +67,27 @@ Source: "installer_deps\winfsp.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Type: files; Name: "{app}\초록멀티 v1.3.exe"
 Type: files; Name: "{app}\초록멀티 v1.4.exe"
 Type: files; Name: "{app}\초록멀티 v1.5.exe"
+Type: files; Name: "{app}\초록멀티 v1.6.exe"
 
 ; 시작 메뉴 구 그룹 폴더(내부 바로가기·uninstaller 링크 포함)
 Type: filesandordirs; Name: "{commonprograms}\초록멀티 v1.3"
 Type: filesandordirs; Name: "{commonprograms}\초록멀티 v1.4"
 Type: filesandordirs; Name: "{commonprograms}\초록멀티 v1.5"
+Type: filesandordirs; Name: "{commonprograms}\초록멀티 v1.6"
 Type: filesandordirs; Name: "{userprograms}\초록멀티 v1.3"
 Type: filesandordirs; Name: "{userprograms}\초록멀티 v1.4"
 Type: filesandordirs; Name: "{userprograms}\초록멀티 v1.5"
+Type: filesandordirs; Name: "{userprograms}\초록멀티 v1.6"
 
 ; 바탕화면 구 바로가기(전 사용자·현재 사용자 양쪽 모두)
 Type: files; Name: "{commondesktop}\초록멀티 v1.3.lnk"
 Type: files; Name: "{commondesktop}\초록멀티 v1.4.lnk"
 Type: files; Name: "{commondesktop}\초록멀티 v1.5.lnk"
+Type: files; Name: "{commondesktop}\초록멀티 v1.6.lnk"
 Type: files; Name: "{userdesktop}\초록멀티 v1.3.lnk"
 Type: files; Name: "{userdesktop}\초록멀티 v1.4.lnk"
 Type: files; Name: "{userdesktop}\초록멀티 v1.5.lnk"
+Type: files; Name: "{userdesktop}\초록멀티 v1.6.lnk"
 
 [Icons]
 ; 아이콘 이름에서 버전을 뺀다 — 다음 업그레이드 때 아이콘이 중복되지 않음.
