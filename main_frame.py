@@ -1086,17 +1086,20 @@ class MainFrame(wx.Frame):
                 )
                 continue
 
-            # 부모 카테고리/자기 자신으로 돌아가는 navigation 링크 거부.
+            # 부모 카테고리로 돌아가는 navigation 링크 거부 — 단, 클럽 컨텍스트
+            # (cl=green 등) 안에 있을 때만. /?mo=potion (동호회 카테고리) 안에서는
+            # /?mo=circle 같은 자식 카테고리가 정당한 sub-menu 이므로 거부하면 안 됨.
+            #
             # sorisem 은 클럽 내부 카테고리 페이지(/?mo=greenN&cl=green 등) 응답에
-            # "일반 동호회"(/?mo=circle), 부모 클럽 자체(/?mo=green&cl=green) 같은
-            # 상위 navigation 링크를 sub-menu 처럼 끼워 넣는다. sub-menu 노이즈로 거부.
+            # "일반 동호회"(/?mo=circle), "동호회"(/?mo=potion) 같은 상위 카테고리
+            # 링크를 sub-menu 처럼 끼워 넣는데, 그건 클럽 컨텍스트일 때만 노이즈.
             PARENT_NAV_URLS_LOW = {
                 "/?mo=circle",
                 "/?mo=circle&cl=circle",
                 "/?mo=potion",
                 "/?mo=potion&cl=potion",
             }
-            if url_lower in PARENT_NAV_URLS_LOW:
+            if current_cl and url_lower in PARENT_NAV_URLS_LOW:
                 _diag_lines.append(
                     f"  REJECT [parent_nav] url={url!r} text={m.name!r}"
                 )
