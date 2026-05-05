@@ -1,9 +1,127 @@
 """소리샘 페이지 HTML 파싱 모듈"""
+import os
 import re
+from datetime import datetime
 
 from bs4 import BeautifulSoup
 
 from config import SORISEM_BASE_URL
+
+
+def _diag_log(name: str, lines: list[str]) -> None:
+    """파싱 진단 로그를 data/<name>.log 에 추가."""
+    try:
+        from config import DATA_DIR  # type: ignore
+        log_dir = DATA_DIR
+    except Exception:
+        log_dir = "data"
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{name}.log")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{ts}]\n")
+            for line in lines:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _diag_save_html(name: str, html: str) -> None:
+    """파싱 대상 HTML 원문을 data/<name>.html 로 저장(매번 덮어씀).
+    문제 진단용 — 사용자가 이 파일을 공유하면 정확한 셀렉터를 추가할 수 있다."""
+    try:
+        from config import DATA_DIR  # type: ignore
+        log_dir = DATA_DIR
+    except Exception:
+        log_dir = "data"
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{name}.html")
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(html or "")
+    except Exception:
+        pass
+
+
+def _extract_view_count_from_row(tr, comment_count: int = 0,
+                                 number_text: str = "") -> int:
+    """게시판 목록의 한 행(tr)에서 조회수를 추출.
+    여러 단계의 폴백을 시도한다."""
+    if tr is None:
+        return 0
+    # 1) 명시적 조회수 클래스
+    for sel in (
+        "td.td_view", ".td_view",
+        "td.td_hit", ".td_hit",
+        "td.td_cnt", ".td_cnt",
+        "td.td_count", ".td_count",
+        "td.hit", ".hit",
+        "td.view", ".view_cnt",
+        "td.if_view", ".if_view",
+    ):
+        el = tr.select_one(sel)
+        if el:
+            m = re.search(r'[\d,]+', el.get_text(strip=True))
+            if m:
+                try:
+                    return int(m.group().replace(",", ""))
+                except ValueError:
+                    pass
+    # 2) td_num 이 두 개 이상이면 마지막을 조회수로 (gnuboard5 기본 스킨)
+    num_tds = tr.select("td.td_num, .td_num")
+    if len(num_tds) >= 2:
+        m = re.search(r'[\d,]+', num_tds[-1].get_text(strip=True))
+        if m:
+            try:
+                v = int(m.group().replace(",", ""))
+                num_int = int(number_text) if (number_text or "").isdigit() else None
+                if num_int is None or v != num_int:
+                    return v
+            except ValueError:
+                pass
+    # 3) 행의 클래스 헤더(<th>)와 결합한 컬럼 매칭
+    table = tr.find_parent("table")
+    if table is not None:
+        header_row = table.select_one("thead tr") or table.select_one("tr")
+        if header_row is not None and header_row is not tr:
+            ths = header_row.find_all(["th", "td"])
+            tds = tr.find_all("td")
+            if ths and len(tds) >= 2:
+                for idx, th in enumerate(ths):
+                    th_text = th.get_text(strip=True)
+                    if (th_text and idx < len(tds)
+                            and re.search(r'조회|Hit|Views|Cnt|Count', th_text,
+                                          re.IGNORECASE)):
+                        m = re.search(r'[\d,]+', tds[idx].get_text(strip=True))
+                        if m:
+                            try:
+                                return int(m.group().replace(",", ""))
+                            except ValueError:
+                                pass
+    # 4) 마지막 폴백: 행의 모든 td 중 숫자만 있는 셀들 — 번호/댓글수와 다른 값
+    tds = tr.find_all("td")
+    candidates = []
+    num_int = None
+    if number_text and number_text.isdigit():
+        num_int = int(number_text)
+    for td in tds:
+        text = td.get_text(strip=True)
+        if not re.fullmatch(r'[\d,]+', text):
+            continue
+        try:
+            v = int(text.replace(",", ""))
+        except ValueError:
+            continue
+        if num_int is not None and v == num_int:
+            continue
+        if comment_count and v == comment_count:
+            continue
+        candidates.append(v)
+    if candidates:
+        # 일반적으로 마지막 숫자 셀이 조회수
+        return candidates[-1]
+    return 0
 
 
 def _unwrap_js_url(href: str) -> str:
@@ -157,13 +275,14 @@ class PostItem:
     """게시글 항목"""
 
     def __init__(self, number: str, title: str, author: str, date: str, url: str,
-                 comment_count: int = 0):
+                 comment_count: int = 0, view_count: int = 0):
         self.number = number
         self.title = title
         self.author = author
         self.date = date
         self.url = url
         self.comment_count = comment_count
+        self.view_count = view_count
 
     @property
     def full_url(self) -> str:
@@ -180,6 +299,8 @@ class PostItem:
         parts.append(self.title)
         if self.comment_count > 0:
             parts.append(f"[댓글 {self.comment_count}]")
+        if self.view_count > 0:
+            parts.append(f"[조회 {self.view_count}]")
         if self.author:
             parts.append(f"- {self.author}")
         if self.date:
@@ -214,7 +335,8 @@ class PostContent:
                  bo_table: str = "", wr_id: str = "",
                  prev_url: str = "", next_url: str = "",
                  edit_url: str = "", delete_url: str = "",
-                 reply_url: str = ""):
+                 reply_url: str = "",
+                 view_count: int = 0):
         self.title = title
         self.author = author
         self.date = date
@@ -229,6 +351,7 @@ class PostContent:
         self.edit_url = edit_url      # 게시물 수정 URL
         self.delete_url = delete_url  # 게시물 삭제 URL (토큰 포함)
         self.reply_url = reply_url    # 게시물 답변 URL
+        self.view_count = view_count  # 게시물 조회수
 
 
 def _is_pagination_link(href: str, text: str) -> bool:
@@ -436,6 +559,10 @@ def parse_board_list(html: str) -> list[PostItem]:
     soup = BeautifulSoup(html, "lxml")
     posts = []
 
+    # 진단: 게시글 링크가 있을 때만 원본 HTML 저장 (메뉴 페이지 제외)
+    if html and "wr_id" in html:
+        _diag_save_html("last_board_list", html)
+
     # 방법 0: Gnuboard5 전용 (td_subject 셀렉터)
     for td in soup.select("td.td_subject, .td_subject"):
         link = td.select_one("a[href*='wr_id']")
@@ -443,12 +570,13 @@ def parse_board_list(html: str) -> list[PostItem]:
             link = td.find("a", href=True)
         if not link:
             continue
-        title = link.get_text(strip=True)
         href = link.get("href", "")
-        if not title or len(title) < 2:
-            continue
 
-        # 댓글 수
+        # 댓글 수: gnuboard5 는 링크 안쪽에 sound_only/cnt_cmt span 으로 댓글 수를
+        # 끼워 넣는다. 제목 텍스트 추출 전에 이 span 들을 떼어내야 한다.
+        # 제목 안에 v1.7 같이 숫자가 들어 있을 때, 단순 title.replace(cmt_text)
+        # 로 댓글 숫자를 빼면 같은 숫자가 제목 본문에서 먼저 잘려나가
+        # "v.7" 처럼 깨지는 문제를 방지.
         comment_count = 0
         cmt_el = td.select_one(".cnt_cmt, .comment_count")
         if cmt_el:
@@ -456,14 +584,22 @@ def parse_board_list(html: str) -> list[PostItem]:
             cmt_match = re.search(r'\d+', cmt_text)
             if cmt_match:
                 comment_count = int(cmt_match.group())
-            title = title.replace(cmt_text, "").strip()
+        # 링크의 사본을 만들어 sound_only/cnt_cmt 만 제거 후 텍스트 추출
+        link_clone = BeautifulSoup(str(link), "lxml")
+        for noise in link_clone.select(".sound_only, .cnt_cmt, .comment_count"):
+            noise.decompose()
+        title = link_clone.get_text(strip=True)
+        if not title or len(title) < 2:
+            continue
+        # 잔여 "댓글N개" 패턴(클래스가 다르게 쓰인 케이스) 만 끝에서 제거
         title = re.sub(r'\s*댓글\s*\d*\s*개\s*$', '', title).strip()
 
-        # 같은 행에서 번호, 작성자, 날짜 추출
+        # 같은 행에서 번호, 작성자, 날짜, 조회수 추출
         tr = td.find_parent("tr")
         number = ""
         author = ""
         date = ""
+        view_count = 0
         if tr:
             num_td = tr.select_one("td.td_num, .td_num")
             if num_td:
@@ -474,8 +610,23 @@ def parse_board_list(html: str) -> list[PostItem]:
             date_td = tr.select_one("td.td_date, .td_date, td.td_datetime")
             if date_td:
                 date = date_td.get_text(strip=True)
+            view_count = _extract_view_count_from_row(
+                tr, comment_count=comment_count, number_text=number
+            )
+            if view_count == 0:
+                row_cells = tr.find_all("td")
+                cell_dump = []
+                for ci, c in enumerate(row_cells):
+                    cls = " ".join(c.get("class") or []) or "-"
+                    txt = c.get_text(strip=True)
+                    cell_dump.append(f"[{ci}]{cls}={txt!r}")
+                _diag_log("board_parser", [
+                    f"[path0] view=0 number={number!r} title={title!r}",
+                    "  cells=" + " | ".join(cell_dump),
+                ])
 
-        posts.append(PostItem(number, title, author, date, href, comment_count))
+        posts.append(PostItem(number, title, author, date, href,
+                              comment_count, view_count))
 
     if posts:
         return posts
@@ -505,7 +656,6 @@ def parse_board_list(html: str) -> list[PostItem]:
         if not title_link:
             continue
 
-        title = title_link.get_text(strip=True)
         url = title_link.get("href", "")
 
         # 댓글 수: 제목 옆 (N) 또는 .cnt_cmt 등
@@ -517,8 +667,12 @@ def parse_board_list(html: str) -> list[PostItem]:
                 cmt_match = re.search(r'\d+', cmt_text)
                 if cmt_match:
                     comment_count = int(cmt_match.group())
-                # 댓글 수 텍스트를 제목에서 제거
-                title = title.replace(cmt_text, "").strip()
+        # 링크 사본에서 sound_only/cnt_cmt 만 제거 후 제목 텍스트 추출 — 제목에
+        # 포함된 같은 숫자(예: "v1.7")가 잘려나가지 않도록.
+        link_clone2 = BeautifulSoup(str(title_link), "lxml")
+        for noise in link_clone2.select(".sound_only, .cnt_cmt, .comment_count"):
+            noise.decompose()
+        title = link_clone2.get_text(strip=True)
         # 제목에서 (N) 패턴으로 댓글 수 추출
         if comment_count == 0:
             cmt_match = re.search(r'\s*\((\d+)\)\s*$', title)
@@ -557,7 +711,23 @@ def parse_board_list(html: str) -> list[PostItem]:
                 date = cell_text
                 break
 
-        posts.append(PostItem(number, title, author, date, url, comment_count))
+        # 조회수: 통합 헬퍼 사용
+        view_count = _extract_view_count_from_row(
+            tr, comment_count=comment_count, number_text=number
+        )
+        if view_count == 0:
+            cell_dump = []
+            for ci, c in enumerate(cells):
+                cls = " ".join(c.get("class") or []) or "-"
+                txt = c.get_text(strip=True)
+                cell_dump.append(f"[{ci}]{cls}={txt!r}")
+            _diag_log("board_parser", [
+                f"[path1] view=0 number={number!r} title={title!r}",
+                "  cells=" + " | ".join(cell_dump),
+            ])
+
+        posts.append(PostItem(number, title, author, date, url,
+                              comment_count, view_count))
 
     # 방법 2: 리스트 기반 게시판 (ul/li 스킨)
     if not posts:
@@ -603,6 +773,11 @@ def parse_board_list(html: str) -> list[PostItem]:
 def parse_post_content(html: str) -> PostContent | None:
     """게시글 본문 페이지를 파싱한다."""
     soup = BeautifulSoup(html, "lxml")
+
+    # 진단: 본문 영역이 있을 때만 원본 HTML 저장 (메뉴 페이지 제외)
+    if html and ("bo_v_con" in html or "bo_v_tit" in html or
+                 "view_content" in html):
+        _diag_save_html("last_post", html)
 
     # 제목: 여러 선택자 시도
     title = ""
@@ -713,6 +888,113 @@ def parse_post_content(html: str) -> PostContent | None:
                 elif not date:
                     date = d
 
+    # 조회수 추출: 정보 영역 / 페이지 전체에서 "조회 N" 또는 "Views N" 패턴
+    view_count = 0
+
+    def _extract_view_from_text(text: str) -> int:
+        if not text:
+            return 0
+        # 소리샘 ar.basic 스킨: "11읽음" — 숫자 뒤에 "읽음" 라벨
+        m = re.search(r'([\d,]+)\s*읽음', text)
+        if not m:
+            # 변형: "11회독" / "11회 읽음" / "11 reads"
+            m = re.search(r'([\d,]+)\s*회독', text)
+        if not m:
+            # gnuboard 표준: "조회 3", "조회수 3", "조회: 3"
+            m = re.search(
+                r'조회\s*(?:수)?\s*[:：]?\s*([\d,]+)\s*(?:회|번|times)?',
+                text,
+            )
+        if not m:
+            m = re.search(r'(?i)\bviews?\s*[:：]?\s*([\d,]+)', text)
+        if not m:
+            m = re.search(r'(?i)\bhits?\s*[:：]?\s*([\d,]+)', text)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+        return 0
+
+    # gnuboard5 표준: <span class="if_view">조회 3</span>
+    for sel in (
+        ".if_view", "#bo_v_info .if_view",
+        ".bo_v_view", ".view_cnt", ".hit",
+        "[class*=hit]", "[class*=view]",
+    ):
+        try:
+            els = soup.select(sel)
+        except Exception:
+            els = []
+        for el in els:
+            v = _extract_view_from_text(el.get_text(" ", strip=True))
+            if v == 0:
+                m = re.search(r'\b\d+\b',
+                              el.get_text(" ", strip=True))
+                if m:
+                    try:
+                        v = int(m.group())
+                    except ValueError:
+                        v = 0
+            if v > 0:
+                view_count = v
+                break
+        if view_count > 0:
+            break
+
+    if view_count == 0 and info_area:
+        view_count = _extract_view_from_text(
+            info_area.get_text(" ", strip=True)
+        )
+
+    if view_count == 0 and info_area:
+        for strong in info_area.find_all(["strong", "b", "span"]):
+            label = strong.get_text(strip=True).replace(":", "").strip()
+            if label in ("조회", "조회수", "Hit", "Views", "Hits"):
+                sibling_text = ""
+                for sib in strong.next_siblings:
+                    t = (
+                        sib.get_text(strip=True)
+                        if hasattr(sib, "get_text")
+                        else str(sib).strip()
+                    )
+                    if t:
+                        sibling_text = t
+                        break
+                m_num = re.search(r'[\d,]+', sibling_text)
+                if m_num:
+                    try:
+                        view_count = int(m_num.group().replace(",", ""))
+                    except ValueError:
+                        pass
+                if view_count > 0:
+                    break
+
+    if view_count == 0:
+        page_text = soup.get_text(" ", strip=True)
+        view_count = _extract_view_from_text(page_text)
+
+    if view_count == 0:
+        # 진단: 본문 페이지 흔적이 있을 때만 (메뉴 페이지 제외)
+        is_post_page = bool(
+            soup.select_one("#bo_v_con, .bo_v_con, #bo_v_tit, .bo_v_tit, "
+                            ".view_content, .view_title, .post_content")
+        )
+        if is_post_page:
+            info_html = ""
+            if info_area:
+                info_html = str(info_area)[:600]
+            info_snippet = ""
+            if info_area:
+                info_snippet = info_area.get_text(" ", strip=True)[:300]
+            head_snippet = soup.get_text(" ", strip=True)[:500]
+            _diag_log("post_parser", [
+                f"view=0 title={title!r}",
+                f"  info_area_text={info_snippet!r}",
+                f"  info_area_html={info_html!r}",
+                f"  head={head_snippet!r}",
+            ])
+
     # 여전히 시간이 없으면 페이지 전체에서 날짜 + 시간 조합 탐색
     if date and not re.search(r'\d{1,2}:\d{2}', date):
         page_text = soup.get_text(" ", strip=True)
@@ -754,27 +1036,60 @@ def parse_post_content(html: str) -> PostContent | None:
         if file_container:
             break
 
+    def _extract_dl_count(scope) -> int:
+        """주어진 영역(li/dd 등)에서 다운로드 횟수를 추출.
+        gnuboard5 는 보통 `<strong>4</strong>회 다운로드` 또는
+        "Download : 4" 같은 형태로 노출한다."""
+        if scope is None:
+            return 0
+        text = scope.get_text(" ", strip=True)
+        m = re.search(r'([\d,]+)\s*회\s*다운로드', text)
+        if not m:
+            m = re.search(r'다운로드\s*[:：]?\s*([\d,]+)', text)
+        if not m:
+            m = re.search(r'(?i)down(?:load)?s?\s*[:：]?\s*([\d,]+)', text)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                return 0
+        return 0
+
     if file_container:
-        for file_link in file_container.find_all("a", href=True):
+        # gnuboard5 의 일반적인 구조: ul.bo_v_file > li > a + (strong N + "회 다운로드")
+        # 항목 단위(li/dt/dd 등) 가 있으면 그 안에서 다운로드 횟수까지 같이 잡는다.
+        item_scopes = file_container.select("li")
+        if not item_scopes:
+            item_scopes = [file_container]
+
+        for scope in item_scopes:
+            file_link = scope.find("a", href=True)
+            if not file_link:
+                continue
             file_name = file_link.get_text(strip=True)
             file_url = file_link.get("href", "")
-            if (file_name and file_url
+            if not (file_name and file_url
                     and not _is_pagination_link(file_url, file_name)
                     and not _is_noise_link(file_url, file_name)
                     and len(file_name) > 1):
-                # 파일명에서 용량 정보 제거
-                # 괄호 포함: "(378byte)", "(21.6KB)"
-                file_name = re.sub(
-                    r'\s*\(\d+[\.\d]*\s*[BbKkMmGg][Bb]?[Yy]?[Tt]?[Ee]?[Ss]?\)\s*$',
-                    '', file_name
-                ).strip()
-                # 괄호 없이: "378byte", "21.6k"
-                file_name = re.sub(
-                    r'\s+\d+[\.\d]*\s*[BbKkMmGg][Bb]?[Yy]?[Tt]?[Ee]?[Ss]?\s*$',
-                    '', file_name
-                ).strip()
-                if file_name:
-                    files.append({"name": file_name, "url": file_url})
+                continue
+            # 파일명에서 용량 정보 제거
+            file_name = re.sub(
+                r'\s*\(\d+[\.\d]*\s*[BbKkMmGg][Bb]?[Yy]?[Tt]?[Ee]?[Ss]?\)\s*$',
+                '', file_name
+            ).strip()
+            file_name = re.sub(
+                r'\s+\d+[\.\d]*\s*[BbKkMmGg][Bb]?[Yy]?[Tt]?[Ee]?[Ss]?\s*$',
+                '', file_name
+            ).strip()
+            if not file_name:
+                continue
+            download_count = _extract_dl_count(scope)
+            files.append({
+                "name": file_name,
+                "url": file_url,
+                "download_count": download_count,
+            })
 
     if not title and not body:
         return None
@@ -868,7 +1183,8 @@ def parse_post_content(html: str) -> PostContent | None:
     return PostContent(title, author, date, body, files, comments,
                        comment_write_url, bo_table, wr_id,
                        prev_url, next_url,
-                       edit_url, delete_url, reply_url)
+                       edit_url, delete_url, reply_url,
+                       view_count=view_count)
 
 
 def _parse_comments(soup: BeautifulSoup) -> list[CommentItem]:

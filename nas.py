@@ -495,6 +495,12 @@ class NasCredentialsDialog(wx.Dialog):
         )
         panel = wx.Panel(self)
 
+        # 비밀번호 본문 (실제 값). 화면 표시는 '*' 만, 실제 값은 여기 보관.
+        # wx.TE_PASSWORD 의 OS 기본 마스크 문자(●/•) 가 일부 한국어 스크린리더
+        # (센스리더 등) 에서 "괄호닫고" 처럼 깨진 발음으로 들리는 문제 회피 —
+        # green_auth 의 LoginDialog 와 동일한 수동 마스킹 방식.
+        self._real_password = ""
+
         lbl_info = wx.StaticText(
             panel,
             label=(
@@ -508,9 +514,11 @@ class NasCredentialsDialog(wx.Dialog):
         self.user_ctrl = wx.TextCtrl(panel, value=default_user, name="NAS 아이디")
 
         lbl_pw = wx.StaticText(panel, label="NAS 비밀번호(&P):")
-        self.pw_ctrl = wx.TextCtrl(
-            panel, style=wx.TE_PASSWORD, name="NAS 비밀번호",
-        )
+        # 수동 마스킹 — TE_PASSWORD 미사용. EVT_KEY_DOWN/EVT_CHAR 로 입력을 잡아
+        # _real_password 에 누적, 화면에는 길이만큼 '*' 만 표시.
+        self.pw_ctrl = wx.TextCtrl(panel, name="NAS 비밀번호")
+        self.pw_ctrl.Bind(wx.EVT_CHAR, self._on_pw_char)
+        self.pw_ctrl.Bind(wx.EVT_KEY_DOWN, self._on_pw_keydown)
 
         ok_btn = wx.Button(panel, wx.ID_OK, "연결(&O)")
         signup_btn = wx.Button(panel, label="회원가입(&S)")
@@ -541,7 +549,54 @@ class NasCredentialsDialog(wx.Dialog):
         self.user_ctrl.SetFocus()
 
     def get_credentials(self) -> tuple[str, str]:
-        return self.user_ctrl.GetValue().strip(), self.pw_ctrl.GetValue()
+        return self.user_ctrl.GetValue().strip(), self._real_password
+
+    # ── 비밀번호 수동 마스킹 ──
+
+    def _refresh_pw_display(self):
+        masked = "*" * len(self._real_password)
+        self.pw_ctrl.ChangeValue(masked)
+        self.pw_ctrl.SetInsertionPointEnd()
+
+    def _on_pw_keydown(self, event):
+        kc = event.GetKeyCode()
+        ctrl = event.ControlDown()
+
+        if kc in (wx.WXK_BACK, wx.WXK_DELETE):
+            if self._real_password:
+                self._real_password = self._real_password[:-1]
+                self._refresh_pw_display()
+            return
+        if ctrl and kc in (ord("V"), ord("v")):
+            try:
+                if wx.TheClipboard.Open():
+                    data = wx.TextDataObject()
+                    if wx.TheClipboard.GetData(data):
+                        self._real_password += data.GetText()
+                        self._refresh_pw_display()
+                    wx.TheClipboard.Close()
+            except Exception:
+                pass
+            return
+        if ctrl and kc in (ord("A"), ord("a"), ord("X"), ord("x"),
+                            ord("C"), ord("c")):
+            return
+        event.Skip()
+
+    def _on_pw_char(self, event):
+        kc = event.GetKeyCode()
+        if kc in (
+            wx.WXK_TAB, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_ESCAPE,
+            wx.WXK_LEFT, wx.WXK_RIGHT, wx.WXK_UP, wx.WXK_DOWN,
+            wx.WXK_HOME, wx.WXK_END,
+        ):
+            event.Skip()
+            return
+        if 32 <= kc < 127:
+            self._real_password += chr(kc)
+            self._refresh_pw_display()
+            return
+        event.Skip()
 
     def _on_signup(self, event):
         """회원가입 버튼 — 초록등대 자료실 가입 구글 폼을 기본 브라우저로 열기."""

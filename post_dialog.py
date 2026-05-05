@@ -186,7 +186,8 @@ class PostDialog(wx.Dialog):
 
     def __init__(self, parent, content: PostContent, session: requests.Session,
                  current_user_id: str | None = None,
-                 current_user_nickname: str | None = None):
+                 current_user_nickname: str | None = None,
+                 at_first: bool = False, at_last: bool = False):
         title = content.title if content.title else "게시물 내용"
         super().__init__(
             parent, title=title,
@@ -199,6 +200,10 @@ class PostDialog(wx.Dialog):
         # 로그인한 사용자의 소리샘 아이디·닉네임. 본인 게시물 여부 검증에 사용.
         self.current_user_id = current_user_id
         self.current_user_nickname = current_user_nickname
+        # 게시판 목록 기준의 경계 — True 면 prev/next 키 입력 시 EndModal 하지 않고
+        # 안내 음성만 재생해 화면 깜빡임/제목 재낭독을 막는다.
+        self.at_first = at_first
+        self.at_last = at_last
 
         # 첨부파일/댓글 유무를 명확하게 판단
         self.has_files = isinstance(content.files, list) and len(content.files) > 0
@@ -389,6 +394,8 @@ class PostDialog(wx.Dialog):
             else:
                 post_date = self.content.date
 
+        view_count = getattr(self.content, "view_count", 0) or 0
+
         # 정보 필드 (요약)
         info = []
         if self.content.author:
@@ -397,6 +404,8 @@ class PostDialog(wx.Dialog):
             info.append(f"작성 날짜: {post_date}")
         if post_time:
             info.append(f"작성 시간: {post_time}")
+        if view_count > 0:
+            info.append(f"조회수: {view_count}")
         self.info_text.SetValue("  |  ".join(info))
 
         # 본문 상단에 메타정보 헤더 추가 → 본문 영역에서도 확인 가능
@@ -404,12 +413,21 @@ class PostDialog(wx.Dialog):
         header_lines.append(f"작성자: {self.content.author or '알 수 없음'}")
         header_lines.append(f"작성 날짜: {post_date or '알 수 없음'}")
         header_lines.append(f"작성 시간: {post_time or '알 수 없음'}")
+        if view_count > 0:
+            header_lines.append(f"조회수: {view_count}")
         header_lines.append("-" * 30)
         header_lines.append("")
         self.body_text.SetValue("\n".join(header_lines) + "\n" + self.content.body)
 
         if self.has_files:
-            names = [f["name"] for f in self.content.files]
+            names = []
+            for f in self.content.files:
+                name = f.get("name", "")
+                dl = f.get("download_count", 0) or 0
+                if dl > 0:
+                    names.append(f"{name} (다운로드 {dl}회)")
+                else:
+                    names.append(name)
             self.file_list.Set(names)
             if names:
                 self.file_list.SetSelection(0)
@@ -424,6 +442,7 @@ class PostDialog(wx.Dialog):
         focused = self.FindFocus()
         alt = event.AltDown()
         ctrl = event.ControlDown()
+        shift = event.ShiftDown()
 
         # 자식 모달 대화상자(CommentDialog 등)가 열려 있을 때는 이 핸들러의
         # 단축키(Alt+M, Alt+D, Ctrl+U, Alt+R, Alt+B, Alt+N 등)가 자식의 입력을
@@ -471,20 +490,25 @@ class PostDialog(wx.Dialog):
 
         # Alt+B: 이전 게시물
         if keycode in (ord("B"), ord("b")) and alt:
-            if self.content.prev_url:
-                self.navigate_result = "prev"
-                self.EndModal(wx.ID_BACKWARD)
-            else:
-                speak("이전 게시물이 없습니다.")
+            self._navigate_prev()
             return
 
         # Alt+N: 다음 게시물
         if keycode in (ord("N"), ord("n")) and alt:
-            if self.content.next_url:
-                self.navigate_result = "next"
-                self.EndModal(wx.ID_FORWARD)
-            else:
-                speak("다음 게시물이 없습니다.")
+            self._navigate_next()
+            return
+
+        # P: 이전 게시물 (수식어 없음).
+        if (keycode in (ord("P"), ord("p"))
+                and not alt and not ctrl and not shift):
+            self._navigate_prev()
+            return
+
+        # N: 다음 게시물 (수식어 없음). 단, 댓글 컨트롤에서 N 은 정렬 단축키.
+        if (keycode in (ord("N"), ord("n"))
+                and not alt and not ctrl and not shift
+                and not (self.has_comments and focused == self.comment_ctrl)):
+            self._navigate_next()
             return
 
         # B: 본문 txt 저장 (본문에 포커스, Alt 없이)
@@ -1601,19 +1625,28 @@ class PostDialog(wx.Dialog):
 
     # ── 이전/다음 게시물 ──
 
+    def _navigate_prev(self):
+        """이전 게시물 이동 시도. 목록 기준으로 첫 게시물이면 EndModal 하지 않고
+        안내만 한다 — 다이얼로그를 닫았다 다시 여는 과정에서 스크린리더가
+        제목을 다시 읽는 깜빡임을 막기 위함."""
+        if self.at_first:
+            speak("첫 게시물입니다.")
+            return
+        self.navigate_result = "prev"
+        self.EndModal(wx.ID_BACKWARD)
+
+    def _navigate_next(self):
+        if self.at_last:
+            speak("마지막 게시물입니다.")
+            return
+        self.navigate_result = "next"
+        self.EndModal(wx.ID_FORWARD)
+
     def on_prev_post(self, event=None):
-        if self.content.prev_url:
-            self.navigate_result = "prev"
-            self.EndModal(wx.ID_BACKWARD)
-        else:
-            speak("이전 게시물이 없습니다.")
+        self._navigate_prev()
 
     def on_next_post(self, event=None):
-        if self.content.next_url:
-            self.navigate_result = "next"
-            self.EndModal(wx.ID_FORWARD)
-        else:
-            speak("다음 게시물이 없습니다.")
+        self._navigate_next()
 
     def on_close(self, event):
         self.EndModal(wx.ID_CANCEL)

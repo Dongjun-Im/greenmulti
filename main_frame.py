@@ -877,6 +877,8 @@ class MainFrame(wx.Frame):
             fields.append(("날짜", post.date))
         if post.comment_count > 0:
             fields.append(("댓글", str(post.comment_count)))
+        if getattr(post, "view_count", 0) > 0:
+            fields.append(("조회수", str(post.view_count)))
         return fields
 
     def _read_field(self, direction: int):
@@ -1424,12 +1426,48 @@ class MainFrame(wx.Frame):
         )
 
     def _show_post_dialog(self, content: PostContent):
-        """게시물 대화상자 표시. 이전/다음 게시물 이동도 처리."""
+        """게시물 대화상자 표시. 이전/다음 게시물 이동도 처리.
+
+        이전/다음 이동은 우선 self.current_posts(현재 게시판 페이지의 목록)
+        에서 위치를 찾아 한 칸 이동한다. 공지(상단 sticky) 게시물에 대해
+        gnuboard 가 반환하는 "이전글/다음글" 링크가 다른 공지로 점프하거나
+        엉뚱한 게시물로 가는 문제를 회피하기 위함. 첫/마지막 경계는 PostDialog
+        내부에서 안내(EndModal 없이) 하므로 다이얼로그 깜빡임이 없다.
+        """
+        def _find_idx(c: PostContent) -> int:
+            if not self.current_posts or not getattr(c, "wr_id", ""):
+                return -1
+            target = str(c.wr_id)
+            for i, p in enumerate(self.current_posts):
+                m = re.search(r'wr_id=(\d+)', p.url or "")
+                if m and m.group(1) == target:
+                    return i
+            return -1
+
+        def _neighbor(c: PostContent, direction: int) -> PostContent | None:
+            idx = _find_idx(c)
+            if idx < 0:
+                return None
+            new_idx = idx + direction
+            if new_idx < 0 or new_idx >= len(self.current_posts):
+                return None
+            return self._fetch_post_sync(self.current_posts[new_idx].url)
+
         while True:
+            idx = _find_idx(content)
+            if idx >= 0:
+                at_first = (idx == 0)
+                at_last = (idx == len(self.current_posts) - 1)
+            else:
+                # 목록에서 찾지 못하면 HTML prev/next URL 유무로 경계 판정
+                at_first = not bool(content.prev_url)
+                at_last = not bool(content.next_url)
+
             dialog = PostDialog(
                 self, content, self.session,
                 current_user_id=self.current_user_id,
                 current_user_nickname=self.current_user_nickname,
+                at_first=at_first, at_last=at_last,
             )
             result = dialog.ShowModal()
             nav = dialog.navigate_result
@@ -1440,18 +1478,22 @@ class MainFrame(wx.Frame):
                 if self.current_board_url:
                     self._load_and_show(self.current_board_url, self.current_menu_name)
                 break
-            elif nav == "prev" and content.prev_url:
+            elif nav == "prev":
                 speak("이전 게시물을 불러오는 중입니다.")
-                new_content = self._fetch_post_sync(content.prev_url)
+                new_content = _neighbor(content, -1)
+                if new_content is None and content.prev_url:
+                    new_content = self._fetch_post_sync(content.prev_url)
                 if new_content:
                     content = new_content
                     continue
                 else:
                     speak("이전 게시물을 불러올 수 없습니다.")
                     break
-            elif nav == "next" and content.next_url:
+            elif nav == "next":
                 speak("다음 게시물을 불러오는 중입니다.")
-                new_content = self._fetch_post_sync(content.next_url)
+                new_content = _neighbor(content, 1)
+                if new_content is None and content.next_url:
+                    new_content = self._fetch_post_sync(content.next_url)
                 if new_content:
                     content = new_content
                     continue
@@ -2508,7 +2550,7 @@ class MainFrame(wx.Frame):
 
         ans = wx.MessageBox(
             "초록등대 자료실에서 로그아웃할까요?\n\n"
-            "마운트된 드라이브를 분리하고 저장된 자료실 아이디·비밀번호를\n"
+            "마운트된 드라이브를 분리하고 저장된 자료실 아이디/비밀번호를\n"
             "삭제합니다. 다음에 연결할 때 다시 입력해야 합니다.",
             "초록등대 자료실 로그아웃",
             wx.YES_NO | wx.ICON_QUESTION, self,
@@ -3788,7 +3830,10 @@ class MainFrame(wx.Frame):
         try:
             self.menu_manager.load()
             self._show_main_menu()
-            speak(f"메뉴를 다시 불러왔습니다. {len(self.menu_manager.menus)}개.")
+            # 화면에 실제 표시되는 메뉴 수 기준으로 안내
+            # (자료실 등 가상/보강 메뉴까지 포함되므로 menu_manager.menus 보다 많을 수 있음)
+            displayed_count = len(self.menu_manager.get_display_names())
+            speak(f"메뉴를 다시 불러왔습니다. {displayed_count}개.")
         except Exception as e:
             speak(f"메뉴를 다시 불러오지 못했습니다. {e}")
             wx.MessageBox(

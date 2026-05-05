@@ -78,7 +78,11 @@ class ChorokMultiApp(wx.App):
                 speak("사용자 메뉴 파일을 사용합니다.")
                 return
 
-            speak("메뉴를 불러오는 중입니다.")
+            # 안내 음성 ("메뉴를 불러오는 중입니다") 은 의도적으로 제거.
+            # 직전에 인증 완료 직후 "초록멀티를 실행합니다" 가 발화되므로,
+            # 곧바로 다른 메시지를 speak() 하면 PurgeBeforeSpeak 동작으로
+            # 그 발화가 즉시 잘려나가 사용자가 듣지 못한다. 메뉴 감지 결과는
+            # 끝부분의 "N개 메뉴를 불러왔습니다" 로 충분히 안내된다.
             resp = self.session.get(SORISEM_BASE_URL, timeout=15)
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -153,13 +157,27 @@ class ChorokMultiApp(wx.App):
             if len(menus) > 1:
                 manager = MenuManager()
                 manager.menus = menus
+                # 자료실 / 전자도서관 / 노원시각장애인학습지원센터 등 표준 메뉴
+                # 자동 보충 — load() 경로 외에는 _ensure_forced_club_menus 가
+                # 호출되지 않으므로 여기서 명시적으로 한 번 돌려준다.
+                # (이걸 빠뜨리면 안내 음성에 보충 메뉴 개수가 누락되어
+                # "13개" 처럼 실제 화면 표시(16개)보다 적게 나온다.)
+                try:
+                    manager._ensure_forced_club_menus()
+                except Exception:
+                    pass
                 manager.save()
                 # 사용자 편집용 텍스트 파일 seed. 이미 있으면 덮어쓰지 않음.
                 try:
                     manager.export_to_txt()
                 except Exception:
                     pass
-                speak(f"{len(menus)}개 메뉴를 불러왔습니다.")
+                # 화면에 실제 표시되는 메뉴 수 기준으로 안내.
+                try:
+                    displayed_count = len(manager.get_display_names())
+                except Exception:
+                    displayed_count = len(menus)
+                speak(f"{displayed_count}개 메뉴를 불러왔습니다.")
             else:
                 speak("메뉴를 불러오지 못했습니다. 기존 메뉴를 사용합니다.")
 

@@ -20,6 +20,28 @@ def _play_auth_success_beep():
         pass
 
 
+def _estimate_speech_seconds(text: str) -> float:
+    """한국어 발화 길이 추정. 한글 음절 ≈ 0.18s, 그 외 0.06s. 1.2~5.0s 클램프."""
+    if not text:
+        return 0.0
+    syllables = sum(1 for ch in text if 0xAC00 <= ord(ch) <= 0xD7A3)
+    others = sum(1 for ch in text if ch.strip() and not (0xAC00 <= ord(ch) <= 0xD7A3))
+    secs = syllables * 0.18 + others * 0.06
+    return max(1.2, min(5.0, secs))
+
+
+def _wait_speech(text: str) -> None:
+    """발화 길이만큼 wx 이벤트는 계속 처리하면서 대기.
+    time.sleep 단독으로 막아 두면 일부 스크린리더가 발화를 정상 큐잉하지 못한다."""
+    end = time.monotonic() + _estimate_speech_seconds(text)
+    while time.monotonic() < end:
+        try:
+            wx.SafeYield()
+        except Exception:
+            pass
+        time.sleep(0.05)
+
+
 def _josa_eul_reul(name: str) -> str:
     """이름 끝 글자에 따라 목적격 조사 '을/를'을 반환."""
     if not name:
@@ -66,7 +88,10 @@ def _do_authenticate(
         (성공 여부, 성공 시 Authenticator, AuthResult.status)
     """
     speak("인증 중입니다. 잠시만 기다려 주세요.")
-    wx.SafeYield()
+    # 발화 완료 대기 — time.sleep 로 wx 이벤트 루프를 블록하면 일부 스크린리더
+    # 브릿지(NVDA Accessibility events 등) 가 멈춰 발화가 묻힐 수 있어, 짧은
+    # SafeYield 루프로 wx 이벤트는 처리하면서 대기한다.
+    _wait_speech("인증 중입니다. 잠시만 기다려 주세요.")
 
     progress = ProgressIndicator()
     progress.start()
@@ -78,7 +103,13 @@ def _do_authenticate(
     if result.is_success:
         _play_auth_success_beep()
         josa = _josa_eul_reul(program_name)
-        speak(f"인증이 완료되었습니다. {program_name}{josa} 실행합니다.")
+        completion_msg = (
+            f"인증이 완료되었습니다. {program_name}{josa} 실행합니다."
+        )
+        speak(completion_msg)
+        # main.py 가 곧바로 다음 단계 (_auto_detect_menus 등) 로 진행하더라도
+        # 이 안내가 잘리지 않도록 발화 길이만큼 wx-yield 루프로 대기.
+        _wait_speech(completion_msg)
         return True, authenticator, result.status
 
     if result.status == AuthResult.NETWORK_ERROR:

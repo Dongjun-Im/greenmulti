@@ -18,6 +18,9 @@ class ProgressIndicator:
     BEEP_STEP_FREQ = 80
     BEEP_STEPS = 5
     SPEAK_INTERVAL = 3.0
+    # 시작 후 INITIAL_SPEAK_DELAY 초가 지나기 전까지는 진행 알림 발화를 보류.
+    # 초기 "인증 중입니다. 잠시만 기다려 주세요." 발화가 잘리지 않게 보호.
+    INITIAL_SPEAK_DELAY = 6.0
 
     def __init__(self):
         self._stop_event = threading.Event()
@@ -43,7 +46,8 @@ class ProgressIndicator:
         except ImportError:
             winsound = None
 
-        last_speak = time.monotonic()
+        start = time.monotonic()
+        last_speak = start
         step = 0
         while not self._stop_event.wait(self.BEEP_INTERVAL):
             if winsound is not None:
@@ -54,6 +58,9 @@ class ProgressIndicator:
                     pass
             step += 1
             now = time.monotonic()
+            # 시작 직후 N초 동안은 발화하지 않음 — 초기 "인증 중입니다" 발화 보호.
+            if now - start < self.INITIAL_SPEAK_DELAY:
+                continue
             if now - last_speak >= self.SPEAK_INTERVAL:
                 speak("인증 진행 중")
                 last_speak = now

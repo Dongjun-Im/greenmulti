@@ -33,6 +33,19 @@ for name in vc_dll_names:
     if os.path.exists(p):
         msvcp_dlls.append((p, '.'))
 
+# accessible_output2 의 lib 디렉토리(nvdaControllerClient32/64.dll, SAAPI32.dll 등)
+# 를 패키지 위치 그대로 번들. 라이브러리가 자체 경로에서 DLL 을 찾기 때문에
+# 패키지 폴더 구조(`accessible_output2/lib/...`) 를 유지해야 한다.
+ao2_datas = []
+try:
+    import accessible_output2
+    _ao2_pkg = os.path.dirname(accessible_output2.__file__)
+    _ao2_lib = os.path.join(_ao2_pkg, 'lib')
+    if os.path.isdir(_ao2_lib):
+        ao2_datas.append((_ao2_lib, 'accessible_output2/lib'))
+except Exception:
+    pass
+
 a = Analysis(
     ['main.py'],
     pathex=[app_dir],
@@ -42,7 +55,7 @@ a = Analysis(
         (os.path.join(app_dir, 'sounds'), 'sounds'),
         (os.path.join(app_dir, 'green_auth'), 'green_auth'),
         (os.path.join(app_dir, 'bin'), 'bin'),
-    ],
+    ] + ao2_datas,
     hiddenimports=[
         'green_auth',
         'green_auth.auth_app',
@@ -57,6 +70,14 @@ a = Analysis(
         'cryptography',
         'cryptography.fernet',
         'cryptography.hazmat',
+        'accessible_output2',
+        'accessible_output2.outputs.auto',
+        'accessible_output2.outputs.nvda',
+        'accessible_output2.outputs.sapi5',
+        'accessible_output2.outputs.system',
+        'accessible_output2.outputs.jaws',
+        'libloader',
+        'platform_utils',
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -72,7 +93,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='초록멀티 v1.7',
+    name='초록멀티 v1.8',
     debug=False,
     strip=False,
     upx=False,
@@ -88,5 +109,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='초록멀티 v1.7',
+    name='초록멀티 v1.8',
 )
