@@ -30,10 +30,12 @@ def _estimate_speech_seconds(text: str) -> float:
     return max(1.2, min(5.0, secs))
 
 
-def _wait_speech(text: str) -> None:
-    """발화 길이만큼 wx 이벤트는 계속 처리하면서 대기.
-    time.sleep 단독으로 막아 두면 일부 스크린리더가 발화를 정상 큐잉하지 못한다."""
-    end = time.monotonic() + _estimate_speech_seconds(text)
+def _wait_speech(text: str, gap: float = 0.25) -> None:
+    """발화 길이 + gap 만큼 wx 이벤트는 처리하면서 대기.
+    time.sleep 단독으로 막아 두면 일부 스크린리더가 발화를 정상 큐잉하지 못한다.
+    gap (기본 0.25s) 은 발화가 완전히 끝난 뒤 다음 안내가 즉시 따라붙어 어색하게
+    이어 들리는 것을 막아 자연스러운 텀을 두면서도 반응 속도를 유지한다."""
+    end = time.monotonic() + _estimate_speech_seconds(text) + max(0.0, gap)
     while time.monotonic() < end:
         try:
             wx.SafeYield()
@@ -87,11 +89,12 @@ def _do_authenticate(
     Returns:
         (성공 여부, 성공 시 Authenticator, AuthResult.status)
     """
-    speak("인증 중입니다. 잠시만 기다려 주세요.")
-    # 발화 완료 대기 — time.sleep 로 wx 이벤트 루프를 블록하면 일부 스크린리더
-    # 브릿지(NVDA Accessibility events 등) 가 멈춰 발화가 묻힐 수 있어, 짧은
-    # SafeYield 루프로 wx 이벤트는 처리하면서 대기한다.
-    _wait_speech("인증 중입니다. 잠시만 기다려 주세요.")
+    intro_msg = "인증 중입니다. 잠시만 기다려 주세요."
+    speak(intro_msg)
+    # 저장된 자격증명이 있으면 인증이 매우 빨리(<500ms) 끝나, 이 안내가
+    # 다음 단계의 "인증이 완료되었습니다" 발화에 즉시 잘려 들리지 않게 된다.
+    # 발화 길이 + 0.5s gap 만큼 메인 스레드 대기로 순서 보장.
+    _wait_speech(intro_msg, gap=0.25)
 
     progress = ProgressIndicator()
     progress.start()
@@ -107,9 +110,10 @@ def _do_authenticate(
             f"인증이 완료되었습니다. {program_name}{josa} 실행합니다."
         )
         speak(completion_msg)
-        # main.py 가 곧바로 다음 단계 (_auto_detect_menus 등) 로 진행하더라도
-        # 이 안내가 잘리지 않도록 발화 길이만큼 wx-yield 루프로 대기.
-        _wait_speech(completion_msg)
+        # 완료 안내가 끝나기 전에 main.py 의 _auto_detect_menus() 가 곧바로
+        # "N개 메뉴를 불러왔습니다" 를 발화해 이 안내를 잘라먹는 문제 방지.
+        # 발화 길이만큼 + 0.5s gap 만큼 메인 스레드를 대기 (wx 이벤트는 yield).
+        _wait_speech(completion_msg, gap=0.25)
         return True, authenticator, result.status
 
     if result.status == AuthResult.NETWORK_ERROR:

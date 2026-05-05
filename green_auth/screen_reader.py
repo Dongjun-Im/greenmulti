@@ -48,6 +48,10 @@ _POWERSHELL_32_PATHS = [
 
 _VW_PROXY: Optional[subprocess.Popen] = None
 _VW_LOCK = threading.Lock()
+# 첫 발화는 RC 응답을 동기 검증 (보이스위드 동작 여부 판정).
+# 두 번째 발화부터는 fire-and-forget — stdout 은 백그라운드 스레드가 드레인.
+_VW_VERIFIED = False
+_VW_DRAIN_THREAD: Optional[threading.Thread] = None
 _VW_DISABLED = False  # 첫 발화 실패 시 True 로 설정해 이후 시도 안 함
 
 
@@ -130,20 +134,42 @@ def _spawn_voicewith_proxy() -> Optional[subprocess.Popen]:
         return None
 
 
+def _start_vw_drain(proc: subprocess.Popen) -> None:
+    """helper 의 stdout(RC 응답) 을 백그라운드에서 소비. pipe buffer 가 가득 차
+    helper 가 hang 하는 것을 방지. 메인 스레드는 발화 후 응답 대기 없이 즉시 반환."""
+    global _VW_DRAIN_THREAD
+    if _VW_DRAIN_THREAD is not None and _VW_DRAIN_THREAD.is_alive():
+        return  # 이미 동작 중 (proc 재시작 시 자동으로 EOF 로 종료됨)
+
+    def _drain():
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:  # EOF — proc 종료
+                    break
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_drain, daemon=True)
+    th.start()
+    _VW_DRAIN_THREAD = th
+
+
 def _speak_voicewith(text: str) -> bool:
     """보이스위드 helper 프록시로 발화 송신. 첫 호출에서 helper 가 자동 spawn.
 
-    helper 가 응답한 RC:0 이면 성공, 그 외(또는 응답 없음) 면 실패.
-    실패 시 _VW_DISABLED 를 True 로 설정해 이후 호출에서 건너뛴다 — 보이스위드
-    가 안 켜진 환경에서 매 발화마다 retry 하는 비용 방지.
+    첫 발화는 RC 를 동기 검증해 보이스위드 동작 여부를 확인하고, 그 이후
+    발화는 fire-and-forget — RC 응답 대기로 인한 메인 스레드 지연(매 발화마다
+    10-50ms) 을 없애 TTS 반응 속도를 빠르게.
     """
-    global _VW_PROXY, _VW_DISABLED
+    global _VW_PROXY, _VW_DISABLED, _VW_VERIFIED
     if _VW_DISABLED:
         return False
     with _VW_LOCK:
         # 살아 있는지 확인. 죽었으면 재시도 한 번.
         if _VW_PROXY is None or _VW_PROXY.poll() is not None:
             _VW_PROXY = _spawn_voicewith_proxy()
+            _VW_VERIFIED = False
             if _VW_PROXY is None:
                 _VW_DISABLED = True
                 return False
@@ -153,8 +179,15 @@ def _speak_voicewith(text: str) -> bool:
         try:
             _VW_PROXY.stdin.write(line.encode("utf-8") + b"\n")
             _VW_PROXY.stdin.flush()
-            # RC 응답 읽기 — non-blocking 이 어려워 짧은 타임아웃 대신 그냥 한 줄.
-            # 보이스위드 RPC 가 실패하면 RC:nonzero 가 즉시 돌아오므로 hang 우려 적음.
+        except Exception:
+            _VW_PROXY = None
+            _VW_DISABLED = True
+            return False
+
+        # 첫 호출만 동기 RC 검증 — 이후엔 응답 대기 없이 즉시 반환.
+        if _VW_VERIFIED:
+            return True
+        try:
             resp = _VW_PROXY.stdout.readline()
         except Exception:
             _VW_PROXY = None
@@ -170,8 +203,9 @@ def _speak_voicewith(text: str) -> bool:
             except Exception:
                 rc = -1
             if rc == 0:
+                _VW_VERIFIED = True
+                _start_vw_drain(_VW_PROXY)
                 return True
-            # 첫 호출이 실패면 — 보이스위드 미실행 또는 RPC 인터페이스 다름 → 비활성화.
             _VW_DISABLED = True
             return False
         return False
@@ -186,7 +220,7 @@ def _cancel_voicewith() -> bool:
         try:
             _VW_PROXY.stdin.write(b"__cancel__\n")
             _VW_PROXY.stdin.flush()
-            _VW_PROXY.stdout.readline()
+            # RC 응답은 백그라운드 드레인 스레드가 소비 — 동기 대기 안 함.
             return True
         except Exception:
             return False
@@ -614,14 +648,27 @@ def _estimate_speech_seconds(text: str) -> float:
     return secs
 
 
+# 한 번이라도 "진짜" 스크린리더(보이스위드/NVDA/센스리더) 가 발화에 성공했는지
+# 추적. True 면 이후 일시적 COM glitch 등으로 그 리더 호출이 False 를 반환해도
+# SAPI/ao2_auto 로 폴백하지 않는다 — 사용자가 듣고 싶어하지 않는 SAPI 음성이
+# 끼어들어 "센스리더 켜져 있는데도 가끔 SAPI 가 말함" 같은 증상 방지.
+_REAL_READER_EVER_USED = False
+
+
 def speak(text: str, wait: bool = False) -> bool:
     """스크린리더로 텍스트를 음성 출력.
 
     우선순위:
-    1. accessible_output2 (NVDA·보이스위드·JAWS 등 자동 감지, 비트 매칭 DLL 동봉)
-    2. nvdaControllerClient 직접 호출 (DLL 다중 경로 폴백)
-    3. 센스리더 COM 자동화
-    4. SAPI 폴백 (위 모두 실패 시)
+    1. 보이스위드 (32-bit DLL via PowerShell 프록시)
+    2. accessible_output2 의 NVDA Output (NVDA·호환 fork)
+    3. nvdaControllerClient 직접 호출
+    4. 센스리더 COM 자동화
+    5. accessible_output2 Auto() — JAWS/ZDSR 등
+    6. SAPI 폴백
+
+    1~4 중 한 번이라도 성공한 적이 있으면 그 이후엔 5/6 (SAPI) 으로 폴백하지
+    않는다. 사용자가 진짜 스크린리더를 쓰고 있는데 일시적 실패로 SAPI 음성이
+    끼어드는 것을 방지.
 
     이전 발화는 모두 중단하고 새 발화를 시작한다.
 
@@ -630,31 +677,44 @@ def speak(text: str, wait: bool = False) -> bool:
         잘라먹는 것을 막을 때 사용 (예: 인증 진입/완료 안내). UI 스레드를
         블록하므로 진행 중 비프음 같은 background 효과는 별도 스레드에서.
     """
+    global _REAL_READER_EVER_USED
     if not text:
         return False
     text = str(text)
     spoken = False
+    real_reader = False
     # 1) 보이스위드 (32-bit DLL via SysWOW64 PowerShell 프록시).
-    #    설치되어 있고 살아 있으면 가장 우선. 첫 호출이 실패하면 자동 비활성화.
     if _speak_voicewith(text):
         spoken = True
-    # 2) accessible_output2 의 NVDA Output 직접 호출 — NVDA·다른 호환 fork.
+        real_reader = True
+    # 2) accessible_output2 의 NVDA Output 직접 호출 — NVDA·호환 fork.
     elif _speak_ao2_nvda(text):
         spoken = True
+        real_reader = True
     # 3) 우리 자체 nvdaControllerClient 직접 호출 (DLL 다중 경로 폴백)
     elif _speak_nvda(text):
         spoken = True
-    # 4) 센스리더 COM 자동화 — 반드시 ao2_auto 보다 먼저. Auto() 는 활성 리더가
-    #    없으면 SAPI 로 조용히 폴백하면서 True 를 반환해 버려, 정작 사용자가
+        real_reader = True
+    # 4) 센스리더 COM 자동화 — ao2_auto 보다 먼저. Auto() 는 활성 리더가
+    #    없으면 SAPI 로 조용히 폴백하면서 True 를 반환해 버려, 사용자가
     #    듣고 싶어하는 센스리더로 가지 못한다.
     elif _speak_sense_reader(text):
         spoken = True
-    # 5) accessible_output2 의 Auto() — JAWS, ZDSR 등 Auto 만 알아낼 수 있는 리더
+        real_reader = True
+    # 진짜 스크린리더가 이전에 한 번이라도 동작했음 → SAPI 폴백 차단.
+    # 일시적 COM glitch (특히 "인증 진행 중" 같은 백그라운드 스레드 발화에서
+    # 가끔 발생) 가 SAPI 로 새는 것을 막는다.
+    elif _REAL_READER_EVER_USED:
+        return False
+    # 5) accessible_output2 의 Auto() — 진짜 리더가 한 번도 안 잡힌 환경 한정
     elif _speak_ao2_auto(text):
         spoken = True
     # 6) SAPI 폴백 — 마지막
     elif _speak_sapi(text):
         spoken = True
+
+    if real_reader:
+        _REAL_READER_EVER_USED = True
 
     if spoken and wait:
         import time as _time

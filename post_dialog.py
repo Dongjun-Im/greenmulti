@@ -316,7 +316,7 @@ class PostDialog(wx.Dialog):
         self.post_reply_btn.Bind(wx.EVT_BUTTON, self.on_post_reply)
 
         # 이전/다음 게시물 버튼
-        self.prev_btn = wx.Button(self.panel, label="이전 게시물 Alt+B")
+        self.prev_btn = wx.Button(self.panel, label="이전 게시물 Alt+P")
         self.next_btn = wx.Button(self.panel, label="다음 게시물 Alt+N")
         self.prev_btn.Enable(bool(self.content.prev_url))
         self.next_btn.Enable(bool(self.content.next_url))
@@ -445,7 +445,7 @@ class PostDialog(wx.Dialog):
         shift = event.ShiftDown()
 
         # 자식 모달 대화상자(CommentDialog 등)가 열려 있을 때는 이 핸들러의
-        # 단축키(Alt+M, Alt+D, Ctrl+U, Alt+R, Alt+B, Alt+N 등)가 자식의 입력을
+        # 단축키(Alt+M, Alt+D, Ctrl+U, Alt+R, Alt+P, Alt+N 등)가 자식의 입력을
         # 가로채서 "마침표 → M/B/…" 같은 엉뚱한 입력 증상을 만들 수 있다.
         # 포커스가 이 대화상자 내부에 없으면 모든 단축키 처리를 건너뛰고
         # 이벤트를 그대로 흘려보낸다.
@@ -488,8 +488,8 @@ class PostDialog(wx.Dialog):
             self.on_post_reply(None)
             return
 
-        # Alt+B: 이전 게시물
-        if keycode in (ord("B"), ord("b")) and alt:
+        # Alt+P: 이전 게시물 (단독 P 와 동일 동작)
+        if keycode in (ord("P"), ord("p")) and alt and not ctrl and not shift:
             self._navigate_prev()
             return
 
@@ -610,7 +610,7 @@ class PostDialog(wx.Dialog):
             menu.AppendSeparator()
             if self.content.prev_url:
                 id_prev = wx.NewIdRef()
-                menu.Append(id_prev, "이전 게시물(&B)\tAlt+B")
+                menu.Append(id_prev, "이전 게시물(&P)\tAlt+P")
                 self.Bind(wx.EVT_MENU, lambda e: self._goto_prev_post(), id=id_prev)
             if self.content.next_url:
                 id_next = wx.NewIdRef()

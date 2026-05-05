@@ -2708,11 +2708,9 @@ class MainFrame(wx.Frame):
                 )
                 self.status_bar.SetStatusText("준비", 0)
                 return
-            # 디버그: HTML을 임시 파일로 저장 (댓글 구조 분석용)
-            import tempfile, os
-            debug_path = os.path.join(tempfile.gettempdir(), "chorok_debug.html")
-            with open(debug_path, "w", encoding="utf-8") as f:
-                f.write(html)
+            # 게시글 클릭마다 임시 디버그 HTML 파일을 디스크에 쓰던 코드를 제거.
+            # 네트워크 드라이브에서 매번 수십~수백 ms 지연이 누적돼 본문 다이얼로그
+            # 표시가 늦어지는 원인이었다. 디버그가 필요하면 별도 명시적 토글로.
 
             content = parse_post_content(html)
             if content:
@@ -4816,7 +4814,7 @@ class MainFrame(wx.Frame):
             "D: 댓글 삭제 (댓글 목록에서)",
             "M: 댓글 수정 (댓글 목록에서)",
             "N: 댓글 정렬 순서 변경",
-            "Alt+B: 이전 게시물",
+            "Alt+P 또는 P: 이전 게시물",
             "Alt+N: 다음 게시물",
             "",
             "=== 팝업(컨텍스트) 메뉴 — v1.6 추가 ===",
