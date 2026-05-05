@@ -34,7 +34,7 @@ class ChorokMultiApp(wx.App):
         self._cleanup_old_update_artifacts()
 
         # 인증 절차 실행
-        authenticator = run_authentication()
+        authenticator = run_authentication(APP_NAME)
         if authenticator is None:
             return False
         self.session = authenticator.session
